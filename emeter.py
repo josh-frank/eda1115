@@ -13,6 +13,7 @@ left/right = tone arm, down/up = sensitivity.
 
 Other keys:
     s   SET: drop the tone arm onto the current reading (needle to center)
+    r   start / stop recording a session to sessions/<timestamp>.srt
     b   switch between glowing-needle and fill-bar display
     q   quit
 
@@ -25,10 +26,12 @@ import argparse
 import curses
 import locale
 import math
+import os
 import queue
 import random
 import threading
 import time
+from datetime import datetime
 
 # --- hardware -------------------------------------------------------------
 ADDR = 0x48
@@ -41,6 +44,7 @@ R_REF, VCC = 100_000, 3.3
 # ---- units (edit this) ----
 UNIT_SCALE = 1e9           # 1e6 = µS (default), 1e9 = nS
 UNIT = {1e6: "µS", 1e9: "nS"}[UNIT_SCALE]
+VALUE_DECIMALS = {1e6: 4, 1e9: 1}[UNIT_SCALE]   # digits written to the .srt
 K = UNIT_SCALE / 1e6       # the range constants below are written in µS, then scaled by K
 
 
@@ -200,6 +204,93 @@ def reader_thread(q, stop, sim, bus_no, addr):
         q.put(f"{type(e).__name__}: {e}")
 
 
+# --- session recording -------------------------------------------------------
+OPEN = "OPEN"              # sample marker: out of range / no contact
+
+
+def srt_time(ms):
+    h, ms = divmod(int(ms), 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def raw_to_srt(raw_path, end_ms=None):
+    """Turn a 'ms,value' raw log into an .srt. Each cue lasts until the next
+    sample; the last one lasts until end_ms (or one tick). -> (path, cues)."""
+    rows = []
+    with open(raw_path) as f:
+        for line in f:
+            ms, _, val = line.rstrip("\n").partition(",")
+            if ms.isdigit():                       # skips a torn last line
+                rows.append((int(ms), val or OPEN))
+    if not rows:
+        return None, 0
+    srt_path = raw_path[: -len(".raw.csv")] + ".srt"
+    with open(srt_path, "w", encoding="utf-8") as out:
+        for i, (ms, val) in enumerate(rows):
+            end = rows[i + 1][0] if i + 1 < len(rows) else (end_ms or ms + TICK_MS)
+            end = max(end, ms + 1)
+            out.write(f"{i + 1}\n{srt_time(ms)} --> {srt_time(end)}\n{val}\n\n")
+    return srt_path, len(rows)
+
+
+class Recorder:
+    """Streams samples to a raw log (survives a power cut), builds the .srt
+    on stop. Leftover raw logs from a crash are converted at startup."""
+
+    def __init__(self, outdir):
+        self.outdir, self.active = outdir, False
+        self.f = None
+
+    def recover(self):
+        """Convert orphaned raw logs; -> list of recovered .srt paths."""
+        done = []
+        if os.path.isdir(self.outdir):
+            for name in sorted(os.listdir(self.outdir)):
+                if name.endswith(".raw.csv"):
+                    raw = os.path.join(self.outdir, name)
+                    path, _ = raw_to_srt(raw)
+                    os.remove(raw)
+                    if path:
+                        done.append(path)
+        return done
+
+    def start(self):
+        os.makedirs(self.outdir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.raw_path = os.path.join(self.outdir, stamp + ".raw.csv")
+        self.f = open(self.raw_path, "w")
+        self.t0 = self.last_flush = time.monotonic()
+        self.n, self.active = 0, True
+
+    @property
+    def elapsed(self):
+        return time.monotonic() - self.t0 if self.active else 0.0
+
+    def add(self, sample):
+        """sample: a number, OPEN, or None (nothing new this tick)."""
+        if not self.active or sample is None:
+            return
+        val = "" if sample == OPEN else f"{sample:.{VALUE_DECIMALS}f}"
+        self.f.write(f"{round(self.elapsed * 1000)},{val}\n")
+        self.n += 1
+        if time.monotonic() - self.last_flush > 1.0:
+            self.f.flush()
+            self.last_flush = time.monotonic()
+
+    def stop(self):
+        """-> (srt path or None, cue count)."""
+        if not self.active:
+            return None, 0
+        self.active = False
+        end_ms = round((time.monotonic() - self.t0) * 1000)
+        self.f.close()
+        path, n = raw_to_srt(self.raw_path, end_ms)
+        os.remove(self.raw_path)
+        return path, n
+
+
 # --- state ------------------------------------------------------------------
 class Needle:
     """Per-segment glow that decays; the head is the live position."""
@@ -230,6 +321,7 @@ class EMeter:
         self.mode = "needle"
         self.contact = True
         self.error = None
+        self.rec, self.note = None, ("", 0.0)      # recorder, (message, expiry)
         self.avg_alpha = 1 - math.exp(-(TICK_MS / 1000) / AVG_TAU_S)
         self.decay = math.exp(-(TICK_MS / 1000) / TRAIL_TAU_S)
 
@@ -267,7 +359,9 @@ class EMeter:
 
     # data ---------------------------------------------------------------------
     def tick(self):
-        gs, bad = [], False
+        """Advance one tick. Returns the sample for the recorder: a number,
+        OPEN (out of range), or None (nothing new)."""
+        gs, bad, sample = [], False, None
         try:
             while True:
                 item = self.q.get_nowait()
@@ -282,6 +376,7 @@ class EMeter:
 
         if gs:
             self.g = sum(gs) / len(gs)
+            sample = self.g
             self.contact = True
             if self.ta is None:
                 self.ta = self.g                      # first reading sets the arm
@@ -289,14 +384,18 @@ class EMeter:
                 self.avg + (self.g - self.avg) * self.avg_alpha
         elif bad:
             self.contact = False
+            sample = OPEN
 
         if self.g is None or self.ta is None or self.segs < 3:
-            return
+            return sample
         for needle, val in ((self.now, self.g), (self.slow, self.avg)):
             head, needle.pegged = head_index(val - self.ta, self.half, self.segs)
             needle.update(head, self.decay)
+        return sample
 
     def status(self):
+        if self.note[0] and time.monotonic() < self.note[1]:
+            return self.note[0]
         if self.error:
             return f"ERROR: {self.error}"
         if self.g is None:
@@ -390,6 +489,10 @@ def draw(win, pal, rich, em):
         return
     segs = em.segs
     safe_add(win, 0, 2, "E-METER", curses.A_BOLD)
+    if em.rec is not None and em.rec.active:
+        t = int(em.rec.elapsed)
+        red = pal.attr(196 if rich else curses.COLOR_RED, curses.A_BOLD)
+        safe_add(win, 0, 12, f"● REC {t // 60:02d}:{t % 60:02d}", red)
     draw_knob(win, pal, rich, 2, "TONE ARM / SCROLL", em.ta_pos,
               f"{em.ta:5.2f} {UNIT}" if em.ta is not None else "  --",
               "A <  > D")
@@ -401,7 +504,7 @@ def draw(win, pal, rich, em):
     draw_meter(win, pal, rich, Y_AVG, "AVG", em.slow, segs, em.mode)
     safe_add(win, Y_STATUS, 1, em.status()[: w - 2], curses.A_DIM)
     safe_add(win, Y_HELP, 1,
-             f"scale = {UNIT} from tone arm   Shift = coarse   s set   b needle/bar   q quit"[: w - 2],
+             f"scale = {UNIT} from tone arm   Shift = coarse   s set   r rec   b needle/bar   q quit"[: w - 2],
              curses.A_DIM)
     win.refresh()
 
@@ -422,8 +525,27 @@ def ui(stdscr, args, q):
     bg, rich = setup_colors()
     pal = Palette(bg)
     em = EMeter(q)
+    em.rec = rec = Recorder(args.outdir)
+    for path in rec.recover():
+        em.note = (f"recovered unfinished session -> {path}", time.monotonic() + 10)
     next_tick = time.monotonic()
+    try:
+        ui_loop(stdscr, em, rec, pal, rich, next_tick)
+    finally:
+        rec.stop()                                    # don't lose a session on quit
 
+
+def toggle_record(em, rec):
+    if rec.active:
+        path, n = rec.stop()
+        msg = f"saved {path} ({n} cues)" if path else "recording empty, nothing saved"
+    else:
+        rec.start()
+        msg = ""
+    em.note = (msg, time.monotonic() + 10)
+
+
+def ui_loop(stdscr, em, rec, pal, rich, next_tick):
     while True:
         h, w = stdscr.getmaxyx()
         em.set_segments(dial_segments(w))
@@ -443,11 +565,13 @@ def ui(stdscr, args, q):
             em.turn_sens(COARSE if key == "L" else 1)
         elif key in ("s", "S"):
             em.set_needle()
+        elif key in ("r", "R"):
+            toggle_record(em, rec)
         elif key in ("b", "B"):
             em.mode = "bar" if em.mode == "needle" else "needle"
 
         if time.monotonic() >= next_tick:
-            em.tick()
+            rec.add(em.tick())
             next_tick += TICK_MS / 1000.0
             if next_tick < time.monotonic():          # fell behind, don't burst
                 next_tick = time.monotonic() + TICK_MS / 1000.0
@@ -460,6 +584,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sim", action="store_true", help="fake EDA signal, no hardware")
     ap.add_argument("--bus", type=int, default=1, help="I2C bus number (default 1)")
+    ap.add_argument("--outdir", default="sessions",
+                    help="where recorded .srt sessions go (default ./sessions)")
     ap.add_argument("--addr", type=lambda s: int(s, 0), default=ADDR,
                     help="ADS1115 address (default 0x48)")
     args = ap.parse_args()
