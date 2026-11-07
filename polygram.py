@@ -34,10 +34,23 @@ CONFIG = 0x4000 | 0x0200 | 0x0000 | 0x0080 | 0x0003
 LSB = 4.096 / 32768
 R_REF, VCC = 100_000, 3.3
 
+# ---- units (edit this) ----
+UNIT_SCALE = 1e9           # 1e6 = µS (default), 1e9 = nS
+UNIT = {1e6: "µS", 1e9: "nS"}[UNIT_SCALE]
+K = UNIT_SCALE / 1e6       # the range constants below are written in µS, then scaled by K
+
+
+def fmt(x):
+    """Compact number for readouts, whatever the unit."""
+    a = abs(x)
+    return (f"{x:.3f}" if a < 10 else f"{x:.2f}" if a < 100 else
+            f"{x:.1f}" if a < 1000 else f"{x:.0f}")
+
+
 # --- display behaviour ----------------------------------------------------
 TICK_MS = 100              # one new graph sample per tick
 BASELINE_TAU_S = 20.0      # baseline follows slow drift over ~this long
-MIN_FULLSCALE_US = 0.10    # auto-squeeze never zooms in past this
+MIN_FULLSCALE = 0.10 * K   # auto-squeeze never zooms in past this (µS, scaled by K)
 LABEL_W = 7                # width of the scale labels on the left
 GUTTER = LABEL_W + 1       # labels + axis column; graph starts after this
 
@@ -165,7 +178,7 @@ def run_i2c(q, stop, bus_no, addr):
             hi, lo = bus.read_i2c_block_data(addr, REG_CONV, 2)
             v = int.from_bytes([hi, lo], "big", signed=True) * LSB
             if 0.001 < v < VCC - 0.001:
-                q.put((VCC - v) / (v * R_REF) * 1e6)     # microsiemens
+                q.put((VCC - v) / (v * R_REF) * UNIT_SCALE)
             else:
                 q.put(None)                              # out of range
             time.sleep(0.02)
@@ -185,7 +198,7 @@ def run_sim(q, stop):
             dt = t - t_b
             g += amp * (1 - math.exp(-dt / 0.6)) * math.exp(-dt / 5.0)
         bumps = [(tb, a) for tb, a in bumps if t - tb < 40]
-        q.put(g + random.gauss(0, 0.015))
+        q.put((g + random.gauss(0, 0.015)) * K)
         time.sleep(0.02)
 
 
@@ -208,7 +221,7 @@ class Polygraph:
         self.error = None
         self.auto = True
         self.symmetric = False
-        self.fullscale = MIN_FULLSCALE_US          # current +/- range in uS
+        self.fullscale = MIN_FULLSCALE          # current +/- range in uS
         self.alpha = (TICK_MS / 1000.0) / BASELINE_TAU_S
         self.resize(cols, half_rows)
 
@@ -226,7 +239,7 @@ class Polygraph:
 
     def zoom(self, factor):
         self.auto = False
-        self.fullscale = max(MIN_FULLSCALE_US / 10, self.fullscale * factor)
+        self.fullscale = max(MIN_FULLSCALE / 10, self.fullscale * factor)
 
     def recenter(self):
         if self.g is not None:
@@ -260,7 +273,7 @@ class Polygraph:
 
         if self.auto:
             peak = max(abs(d) for d in self.devs)
-            target = max(peak / 0.9, MIN_FULLSCALE_US)
+            target = max(peak / 0.9, MIN_FULLSCALE)
             if target > self.fullscale:
                 self.fullscale = target                              # squeeze in fast
             else:
@@ -271,8 +284,8 @@ class Polygraph:
             return f"ERROR: {self.error}"
         if self.g is None:
             return "waiting for data..."
-        msg = (f"{self.g:6.2f} uS  base {self.baseline:6.2f}  "
-               f"full-scale +/-{self.fullscale:5.3f} uS "
+        msg = (f"{self.g:6.2f} {UNIT}  base {self.baseline:6.2f}  "
+               f"full-scale +/-{fmt(self.fullscale)} {UNIT} "
                f"({'auto' if self.auto else 'manual'}, "
                f"{'symmetric' if self.symmetric else 'signed'})")
         if not self.contact:
@@ -372,7 +385,7 @@ def ui(stdscr, args, pg_q):
         y = len(rows) + 1
         safe_add(stdscr, y, 1, pg.status()[: w - 2], curses.A_DIM)
         safe_add(stdscr, y + 1, 1,
-                 "scale = uS from baseline   up/down sensitivity  a auto  "
+                 f"scale = {UNIT} from baseline   up/down sensitivity  a auto  "
                  "r recenter  m signed/symmetric  q quit"[: w - 2],
                  curses.A_DIM)
         stdscr.refresh()
@@ -391,8 +404,7 @@ def main():
                     help="max character rows above/below center (default: fill height)")
     args = ap.parse_args()
 
-    locale.setlocale(locale.LC_ALL, "")
-                                                      # needed for block characters
+    locale.setlocale(locale.LC_ALL, "")               # needed for block characters
     q, stop = queue.Queue(), threading.Event()
     threading.Thread(target=reader_thread, daemon=True,
                      args=(q, stop, args.sim, args.bus, args.addr)).start()

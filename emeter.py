@@ -17,7 +17,8 @@ Other keys:
     q   quit
 
 Top meter is the live needle, bottom meter is a ~2 s average. The scale
-between them is in uS relative to the tone arm setting and auto-ranges with
+between them is in µS (or nS: see UNIT_SCALE) relative to the tone arm setting
+and auto-ranges with
 sensitivity. Data comes from an ADS1115 via smbus2, or --sim for a fake signal.
 """
 import argparse
@@ -37,14 +38,27 @@ CONFIG = 0x4000 | 0x0200 | 0x0000 | 0x0080 | 0x0003
 LSB = 4.096 / 32768
 R_REF, VCC = 100_000, 3.3
 
+# ---- units (edit this) ----
+UNIT_SCALE = 1e9           # 1e6 = µS (default), 1e9 = nS
+UNIT = {1e6: "µS", 1e9: "nS"}[UNIT_SCALE]
+K = UNIT_SCALE / 1e6       # the range constants below are written in µS, then scaled by K
+
+
+def fmt(x):
+    """Compact number for readouts, whatever the unit."""
+    a = abs(x)
+    return (f"{x:.3f}" if a < 10 else f"{x:.2f}" if a < 100 else
+            f"{x:.1f}" if a < 1000 else f"{x:.0f}")
+
+
 # --- behaviour --------------------------------------------------------------
 TICK_MS = 50               # 20 updates a second
 TRAIL_TAU_S = 0.5          # how long the needle glow takes to fade
 AVG_TAU_S = 2.0            # smoothing for the bottom meter
-# ---- knob ranges (edit these) ----
-TA_MIN, TA_MAX = -30.0, 30.0      # tone arm range, uS (dial center = this value)
-HALF_MIN, HALF_MAX = 0.02, 20.0   # dial half-width range, uS (sensitivity knob)
-START_HALF = 0.25                 # starting dial half-width, uS
+# ---- knob ranges (edit these; written in µS, scaled by K for your unit) ----
+TA_MIN, TA_MAX = -30.0 * K, 30.0 * K      # tone arm range (dial center = this value)
+HALF_MIN, HALF_MAX = 0.02 * K, 20.0 * K   # dial half-width range (sensitivity knob)
+START_HALF = 0.25 * K                     # starting dial half-width
 COARSE = 5                 # Shift multiplier
 
 # --- layout -----------------------------------------------------------------
@@ -155,7 +169,7 @@ def run_i2c(q, stop, bus_no, addr):
             hi, lo = bus.read_i2c_block_data(addr, REG_CONV, 2)
             v = int.from_bytes([hi, lo], "big", signed=True) * LSB
             if 0.001 < v < VCC - 0.001:
-                q.put((VCC - v) / (v * R_REF) * 1e6)     # microsiemens
+                q.put((VCC - v) / (v * R_REF) * UNIT_SCALE)
             else:
                 q.put(None)                              # out of range
             time.sleep(0.02)
@@ -175,7 +189,7 @@ def run_sim(q, stop):
             dt = t - t_b
             g += amp * (1 - math.exp(-dt / 0.4)) * math.exp(-dt / 4.0)
         bumps = [(tb, a) for tb, a in bumps if t - tb < 40]
-        q.put(g + random.gauss(0, 0.008))
+        q.put((g + random.gauss(0, 0.008)) * K)
         time.sleep(0.02)
 
 
@@ -287,8 +301,8 @@ class EMeter:
             return f"ERROR: {self.error}"
         if self.g is None:
             return "waiting for data..."
-        msg = (f"reading {self.g:6.2f} µS   tone arm {self.ta:5.2f} µS   "
-               f"dial ±{self.half:.3f} µS   {self.mode}")
+        msg = (f"reading {self.g:6.2f} {UNIT}   tone arm {self.ta:5.2f} {UNIT}   "
+               f"dial ±{fmt(self.half)} {UNIT}   {self.mode}")
         if self.now.pegged:
             msg += "   OFF DIAL" + (" >" if self.g > self.ta else " <")
         if not self.contact:
@@ -377,17 +391,17 @@ def draw(win, pal, rich, em):
     segs = em.segs
     safe_add(win, 0, 2, "E-METER", curses.A_BOLD)
     draw_knob(win, pal, rich, 2, "TONE ARM / SCROLL", em.ta_pos,
-              f"{em.ta:5.2f} µS" if em.ta is not None else "  --",
+              f"{em.ta:5.2f} {UNIT}" if em.ta is not None else "  --",
               "A <  > D")
     draw_knob(win, pal, rich, 26, "SENSITIVITY / ZOOM", em.sens_pos,
-              f"x{1 / em.half:.1f}  ±{em.half:.3f} µS",
+              f"x{K / em.half:.1f}  ±{fmt(em.half)} {UNIT}",
               "K <  > L")
     draw_meter(win, pal, rich, Y_NOW, "NOW", em.now, segs, em.mode)
     draw_scale(win, Y_TICKS, em.half, segs, w)
     draw_meter(win, pal, rich, Y_AVG, "AVG", em.slow, segs, em.mode)
     safe_add(win, Y_STATUS, 1, em.status()[: w - 2], curses.A_DIM)
     safe_add(win, Y_HELP, 1,
-             "scale = µS from tone arm   Shift = coarse   s set   b needle/bar   q quit"[: w - 2],
+             f"scale = {UNIT} from tone arm   Shift = coarse   s set   b needle/bar   q quit"[: w - 2],
              curses.A_DIM)
     win.refresh()
 
