@@ -14,6 +14,9 @@ left/right = tone arm, down/up = sensitivity.
 Other keys:
     s   SET: drop the tone arm onto the current reading (needle to center)
     r   start / stop recording a session to sessions/<timestamp>.srt
+    t   tone arm tracking: the arm follows the slow baseline (any manual
+        tone arm move or SET turns it back off)
+    e   show / hide the event log (squeezes and falls found by elron.py)
     b   switch between glowing-needle and fill-bar display
     q   quit
 
@@ -31,7 +34,13 @@ import queue
 import random
 import threading
 import time
+from collections import deque
 from datetime import datetime
+
+try:
+    from elron import Elron           # squeeze + fall detector, same folder
+except ImportError:
+    Elron = None
 
 # --- hardware -------------------------------------------------------------
 ADDR = 0x48
@@ -45,6 +54,9 @@ R_REF, VCC = 100_000, 3.3
 UNIT_SCALE = 1e9           # 1e6 = µS (default), 1e9 = nS
 UNIT = {1e6: "µS", 1e9: "nS"}[UNIT_SCALE]
 VALUE_DECIMALS = {1e6: 4, 1e9: 1}[UNIT_SCALE]   # digits written to the .srt
+ELRON_SIGN = +1            # +1: events are RISES in conductance (squeezing the
+                           # cans lowers resistance). Flip to -1 if squeezes
+                           # don't register.
 K = UNIT_SCALE / 1e6       # the range constants below are written in µS, then scaled by K
 
 
@@ -73,6 +85,7 @@ MIN_W, MIN_H = 40, 18
 Y_KNOB_LABEL, Y_KNOB, Y_KNOB_VAL, Y_KNOB_KEYS = 2, 3, 6, 7
 Y_NOW, Y_TICKS, Y_LABELS, Y_AVG = 9, 11, 12, 13
 Y_STATUS, Y_HELP = 16, 17
+Y_LOG, LOG_ROWS = 19, 5    # event log (e): header row, then newest events
 
 KNOB_RING = ["╭─────╮",
              "│     │",
@@ -183,8 +196,15 @@ def run_sim(q, stop):
     """Fake EDA: slow wander + occasional skin-conductance responses + noise."""
     t0 = time.time()
     bumps, next_bump = [], 3.0
+    scripted, next_script, n_script = [], 15.0, 0   # a squeeze, then a fall, ...
     while not stop.is_set():
         t = time.time() - t0
+        if t >= next_script:
+            scripted.append((t, "squeeze" if n_script % 2 == 0 else "fall",
+                             random.uniform(0.6, 1.4)))
+            n_script += 1
+            next_script += 30.0
+        scripted = [e for e in scripted if t - e[0] < 20]
         if t >= next_bump:
             bumps.append((t, random.uniform(0.05, 0.4)))
             next_bump = t + random.uniform(4, 12)
@@ -193,6 +213,14 @@ def run_sim(q, stop):
             dt = t - t_b
             g += amp * (1 - math.exp(-dt / 0.4)) * math.exp(-dt / 4.0)
         bumps = [(tb, a) for tb, a in bumps if t - tb < 40]
+        for t_e, kind, amp in scripted:
+            dt = t - t_e
+            if kind == "squeeze":          # quick rounded pulse, back in ~1.2 s
+                if dt < 1.2:
+                    g += amp * 0.5 * (1 - math.cos(2 * math.pi * dt / 1.2))
+            else:                          # 4 s ramp, then 60% of it stays
+                g += amp * (min(dt / 4.0, 1.0) if dt < 4.0 else
+                            1.0 - 0.4 * min((dt - 4.0) / 10.0, 1.0))
         q.put((g + random.gauss(0, 0.008)) * K)
         time.sleep(0.02)
 
@@ -322,6 +350,11 @@ class EMeter:
         self.contact = True
         self.error = None
         self.rec, self.note = None, ("", 0.0)      # recorder, (message, expiry)
+        self.elron = Elron(scale=K, sign=ELRON_SIGN) if Elron else None
+        self.events = deque(maxlen=20)             # newest last
+        self.show_log = False
+        self.track = False                         # tone arm follows baseline
+        self.t_start = time.monotonic()
         self.avg_alpha = 1 - math.exp(-(TICK_MS / 1000) / AVG_TAU_S)
         self.decay = math.exp(-(TICK_MS / 1000) / TRAIL_TAU_S)
 
@@ -333,6 +366,7 @@ class EMeter:
     def turn_ta(self, n):
         """n > 0 raises the tone arm. One step = half a LED at current zoom."""
         if self.ta is not None:
+            self.track = False                     # a hand on the knob wins
             self.ta = max(TA_MIN, min(TA_MAX, self.ta + n * 0.5 * self.seg_us))
 
     def turn_sens(self, n):
@@ -341,7 +375,30 @@ class EMeter:
 
     def set_needle(self):
         if self.g is not None:
+            self.track = False
             self.ta = self.g
+
+    def toggle_track(self):
+        if self.elron is None:
+            msg = "elron.py not found next to emeter.py"
+        else:
+            self.track = not self.track
+            msg = f"tone arm tracking {'ON' if self.track else 'OFF'}"
+        self.note = (msg, time.monotonic() + 4)
+
+    def feed(self, sample, now):
+        """Give the detector what the recorder got: a number, OPEN or None."""
+        if self.elron is None or sample is None:
+            return
+        for ev in self.elron.update(None if sample == OPEN else sample, now):
+            rec_t = None
+            if self.rec is not None and self.rec.active:
+                rec_t = ev["t"] - self.rec.t0
+                rec_t = rec_t if rec_t >= 0 else None
+            self.events.append((ev, rec_t, ev["t"] - self.t_start))
+            self.note = (event_text(ev), now + 10)
+        if self.track and self.elron.baseline is not None:
+            self.ta = max(TA_MIN, min(TA_MAX, self.elron.baseline))
 
     @property
     def ta_pos(self):
@@ -407,6 +464,19 @@ class EMeter:
         if not self.contact:
             msg += "   [out of range, check contact]"
         return msg
+
+
+def event_text(ev):
+    amp = f"{fmt(ev['amplitude'])} {UNIT}"
+    if ev["kind"] == "fall":
+        return (f"FALL  {amp}  attack {ev['attack_s']:.1f}s  "
+                f"came back {ev['recovery']:.0%}")
+    return f"SQUEEZE  {amp}  attack {ev['attack_s']:.1f}s  conf {ev['confidence']:.2f}"
+
+
+def mmss(sec):
+    sec = int(sec)
+    return f"{sec // 60:02d}:{sec % 60:02d}"
 
 
 # --- curses UI --------------------------------------------------------------
@@ -480,6 +550,44 @@ def draw_knob(win, pal, rich, x, title, t, value, keys):
     safe_add(win, Y_KNOB_KEYS, x, keys, curses.A_DIM)
 
 
+def draw_badge(win, pal, rich, em, w):
+    """Title-row readout of what the two detectors are doing right now."""
+    el = em.elron
+    if el is None:
+        return
+    if em.track:
+        safe_add(win, 0, 28, "TRACK", pal.attr(46 if rich else curses.COLOR_GREEN, curses.A_BOLD))
+    busy = {"SQUEEZE": pal.attr(214 if rich else curses.COLOR_YELLOW, curses.A_BOLD),
+            "FALLING": pal.attr(45 if rich else curses.COLOR_CYAN, curses.A_BOLD)}
+    if el.sq_state == "IDLE" and el.fl_state == "IDLE":
+        parts = [("elron: calibrating", curses.A_DIM)]
+    else:
+        parts = []
+        for name, st in (("squeeze", el.sq_state), ("fall", el.fl_state)):
+            parts.append((f"{name} ", curses.A_DIM))
+            parts.append((f"{st.lower():8s}", busy.get(st, curses.A_DIM)))
+    x = max(34, w - sum(len(t) for t, _ in parts) - 2)
+    for text, attr in parts:
+        safe_add(win, 0, x, text, attr)
+        x += len(text)
+
+
+def draw_log(win, pal, rich, em, h, w):
+    safe_add(win, Y_LOG, 1, "EVENTS  (● = time into recording, else time since launch)"[: w - 2],
+             curses.A_DIM)
+    colors = {"squeeze": pal.attr(214 if rich else curses.COLOR_YELLOW),
+              "fall": pal.attr(45 if rich else curses.COLOR_CYAN)}
+    if not em.events:
+        safe_add(win, Y_LOG + 1, 3, "nothing yet", curses.A_DIM)
+    for i, (ev, rec_t, since) in enumerate(reversed(list(em.events))):
+        y = Y_LOG + 1 + i
+        if i >= LOG_ROWS or y >= h:
+            break
+        stamp = f"●{mmss(rec_t)}" if rec_t is not None else f" {mmss(since)}"
+        safe_add(win, y, 1, stamp, curses.A_DIM)
+        safe_add(win, y, 8, event_text(ev)[: max(0, w - 10)], colors[ev["kind"]])
+
+
 def draw(win, pal, rich, em):
     h, w = win.getmaxyx()
     win.erase()
@@ -493,6 +601,7 @@ def draw(win, pal, rich, em):
         t = int(em.rec.elapsed)
         red = pal.attr(196 if rich else curses.COLOR_RED, curses.A_BOLD)
         safe_add(win, 0, 12, f"● REC {t // 60:02d}:{t % 60:02d}", red)
+    draw_badge(win, pal, rich, em, w)
     draw_knob(win, pal, rich, 2, "TONE ARM / SCROLL", em.ta_pos,
               f"{em.ta:5.2f} {UNIT}" if em.ta is not None else "  --",
               "A <  > D")
@@ -504,8 +613,10 @@ def draw(win, pal, rich, em):
     draw_meter(win, pal, rich, Y_AVG, "AVG", em.slow, segs, em.mode)
     safe_add(win, Y_STATUS, 1, em.status()[: w - 2], curses.A_DIM)
     safe_add(win, Y_HELP, 1,
-             f"scale = {UNIT} from tone arm   Shift = coarse   s set   r rec   b needle/bar   q quit"[: w - 2],
+             f"scale = {UNIT} from tone arm   Shift = coarse   s set   t track   r rec   e log   b needle/bar   q quit"[: w - 2],
              curses.A_DIM)
+    if em.show_log:
+        draw_log(win, pal, rich, em, h, w)
     win.refresh()
 
 
@@ -567,11 +678,17 @@ def ui_loop(stdscr, em, rec, pal, rich, next_tick):
             em.set_needle()
         elif key in ("r", "R"):
             toggle_record(em, rec)
+        elif key in ("t", "T"):
+            em.toggle_track()
+        elif key in ("e", "E"):
+            em.show_log = not em.show_log
         elif key in ("b", "B"):
             em.mode = "bar" if em.mode == "needle" else "needle"
 
         if time.monotonic() >= next_tick:
-            rec.add(em.tick())
+            sample = em.tick()
+            rec.add(sample)
+            em.feed(sample, time.monotonic())
             next_tick += TICK_MS / 1000.0
             if next_tick < time.monotonic():          # fell behind, don't burst
                 next_tick = time.monotonic() + TICK_MS / 1000.0
