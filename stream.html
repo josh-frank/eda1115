@@ -86,7 +86,8 @@
       baseline += (g - baseline) * Math.min(dt / BASELINE_TAU_S, 1);
 
       const drive = (smooth - baseline) * sensitivity;
-      const final = Math.max(-1, Math.min(1, -drive + toneArm));
+      // convention: resistance falls (conductance rises) = needle goes right/clockwise
+      const final = Math.max(-1, Math.min(1, drive + toneArm));
       needle.style.transform = `rotate(${-90 + (final + 1) * 90}deg)`;
     }
 
