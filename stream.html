@@ -1,0 +1,93 @@
+<!doctype html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>GSR</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px system-ui, sans-serif; margin: 1.5rem; max-width: 40rem; }
+  #g { font-size: 3rem; font-variant-numeric: tabular-nums; }
+  #bar { height: 1rem; background: currentColor; width: 0; transition: width .1s; }
+  #st { opacity: .6; min-height: 1.5em; }
+  canvas { width: 100%; height: 120px; display: block; margin-top: 1rem; }
+  #src { margin-bottom: 1rem; }
+  #pi { width: 16rem; max-width: 60%; }
+</style>
+<div id=src>
+  <input id=pi placeholder="raspberrypi.local:8000" spellcheck=false>
+  <button id=go>connect</button>
+</div>
+<div id=g>&hellip;</div>
+<div id=bar></div>
+<div id=st>connecting</div>
+<label><input type=checkbox id=nano> nS (nano) instead of &micro;S</label>
+<canvas id=c width=600 height=120></canvas>
+<script>
+const $ = id => document.getElementById(id);
+const buf = [];                       // [t, g|null]
+let es = null, last = 0, lastG = null;
+
+const show = () => {
+  const g = lastG, n = $('nano').checked;
+  $('g').innerHTML = g == null ? '&mdash;' : n ? Math.round(g * 1000) + ' nS' : g.toFixed(2) + ' &micro;S';
+};
+try { $('nano').checked = localStorage.nano === '1'; } catch (e) {}
+$('nano').onchange = () => { try { localStorage.nano = $('nano').checked ? '1' : '0'; } catch (e) {} show(); };
+
+function connect() {
+  let a = $('pi').value.trim();
+  if (!a) return;
+  try { localStorage.pi = a; } catch (e) {}
+  if (!/^https?:\/\//.test(a)) a = 'http://' + a;
+  if (es) es.close();
+  buf.length = 0; lastG = null; last = 0; show();
+  $('bar').style.width = 0;
+  $('st').textContent = 'connecting';
+  es = new EventSource(a.replace(/\/+$/, '') + '/stream');
+  es.onopen = () => { buf.length = 0; };      // server replays the last 60 s on every (re)connect
+  es.onmessage = e => {
+    const d = JSON.parse(e.data);
+    last = performance.now();
+    buf.push([d.t, d.g]);
+    while (buf.length && d.t - buf[0][0] > 60) buf.shift();
+    lastG = d.g; show();
+    $('bar').style.width = d.g == null ? 0 : Math.min(d.g / 30, 1) * 100 + '%';
+    $('st').textContent = d.g == null ? 'no contact / out of range' : '';
+  };
+  es.onerror = () => { $('st').textContent = 'stream lost, retrying'; };
+}
+
+// address: ?pi=host:port, else last used, else default
+let saved = '';
+try { saved = localStorage.pi || ''; } catch (e) {}
+$('pi').value = new URLSearchParams(location.search).get('pi') || saved || 'raspberrypi.local:8000';
+$('go').onclick = connect;
+$('pi').onkeydown = e => { if (e.key === 'Enter') connect(); };
+
+setInterval(() => {
+  if (last && performance.now() - last > 2000) $('st').textContent = 'no data';
+  draw();
+}, 100);
+
+function draw() {
+  const c = $('c'), x = c.getContext('2d'), W = c.width, H = c.height;
+  x.clearRect(0, 0, W, H);
+  const pts = buf.filter(p => p[1] > 0);
+  if (pts.length < 2) return;
+  const ls = pts.map(p => Math.log(p[1]));
+  let lo = Math.min(...ls), hi = Math.max(...ls);
+  const span = Math.max(hi - lo, Math.log(1.1)), mid = (hi + lo) / 2;
+  lo = mid - span / 2;
+  const t1 = buf[buf.length - 1][0];
+  x.strokeStyle = getComputedStyle(document.body).color;
+  x.lineWidth = 2; x.beginPath();
+  let pen = false;
+  for (const [t, g] of buf) {
+    if (g == null || g <= 0) { pen = false; continue; }
+    const px = W - (t1 - t) / 60 * W, py = H - (Math.log(g) - lo) / span * (H - 8) - 4;
+    pen ? x.lineTo(px, py) : x.moveTo(px, py); pen = true;
+  }
+  x.stroke();
+}
+
+connect();
+</script>
