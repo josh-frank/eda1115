@@ -1,93 +1,225 @@
-<!doctype html>
-<meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<title>GSR</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font: 16px system-ui, sans-serif; margin: 1.5rem; max-width: 40rem; }
-  #g { font-size: 3rem; font-variant-numeric: tabular-nums; }
-  #bar { height: 1rem; background: currentColor; width: 0; transition: width .1s; }
-  #st { opacity: .6; min-height: 1.5em; }
-  canvas { width: 100%; height: 120px; display: block; margin-top: 1rem; }
-  #src { margin-bottom: 1rem; }
-  #pi { width: 16rem; max-width: 60%; }
-</style>
-<div id=src>
-  <input id=pi placeholder="raspberrypi.local:8000" spellcheck=false>
-  <button id=go>connect</button>
-</div>
-<div id=g>&hellip;</div>
-<div id=bar></div>
-<div id=st>connecting</div>
-<label><input type=checkbox id=nano> nS (nano) instead of &micro;S</label>
-<canvas id=c width=600 height=120></canvas>
-<script>
-const $ = id => document.getElementById(id);
-const buf = [];                       // [t, g|null]
-let es = null, last = 0, lastG = null;
+<!DOCTYPE html>
+<html>
 
-const show = () => {
-  const g = lastG, n = $('nano').checked;
-  $('g').innerHTML = g == null ? '&mdash;' : n ? Math.round(g * 1000) + ' nS' : g.toFixed(2) + ' &micro;S';
-};
-try { $('nano').checked = localStorage.nano === '1'; } catch (e) {}
-$('nano').onchange = () => { try { localStorage.nano = $('nano').checked ? '1' : '0'; } catch (e) {} show(); };
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>e meter</title>
+  <link rel="stylesheet" type="text/css" href="stream.css">
+</head>
 
-function connect() {
-  let a = $('pi').value.trim();
-  if (!a) return;
-  try { localStorage.pi = a; } catch (e) {}
-  if (!/^https?:\/\//.test(a)) a = 'http://' + a;
-  if (es) es.close();
-  buf.length = 0; lastG = null; last = 0; show();
-  $('bar').style.width = 0;
-  $('st').textContent = 'connecting';
-  es = new EventSource(a.replace(/\/+$/, '') + '/stream');
-  es.onopen = () => { buf.length = 0; };      // server replays the last 60 s on every (re)connect
-  es.onmessage = e => {
-    const d = JSON.parse(e.data);
-    last = performance.now();
-    buf.push([d.t, d.g]);
-    while (buf.length && d.t - buf[0][0] > 60) buf.shift();
-    lastG = d.g; show();
-    $('bar').style.width = d.g == null ? 0 : Math.min(d.g / 30, 1) * 100 + '%';
-    $('st').textContent = d.g == null ? 'no contact / out of range' : '';
-  };
-  es.onerror = () => { $('st').textContent = 'stream lost, retrying'; };
-}
+<body>
 
-// address: ?pi=host:port, else last used, else default
-let saved = '';
-try { saved = localStorage.pi || ''; } catch (e) {}
-$('pi').value = new URLSearchParams(location.search).get('pi') || saved || 'raspberrypi.local:8000';
-$('go').onclick = connect;
-$('pi').onkeydown = e => { if (e.key === 'Enter') connect(); };
+  <main>
 
-setInterval(() => {
-  if (last && performance.now() - last > 2000) $('st').textContent = 'no data';
-  draw();
-}, 100);
+    <section>
 
-function draw() {
-  const c = $('c'), x = c.getContext('2d'), W = c.width, H = c.height;
-  x.clearRect(0, 0, W, H);
-  const pts = buf.filter(p => p[1] > 0);
-  if (pts.length < 2) return;
-  const ls = pts.map(p => Math.log(p[1]));
-  let lo = Math.min(...ls), hi = Math.max(...ls);
-  const span = Math.max(hi - lo, Math.log(1.1)), mid = (hi + lo) / 2;
-  lo = mid - span / 2;
-  const t1 = buf[buf.length - 1][0];
-  x.strokeStyle = getComputedStyle(document.body).color;
-  x.lineWidth = 2; x.beginPath();
-  let pen = false;
-  for (const [t, g] of buf) {
-    if (g == null || g <= 0) { pen = false; continue; }
-    const px = W - (t1 - t) / 60 * W, py = H - (Math.log(g) - lo) / span * (H - 8) - 4;
-    pen ? x.lineTo(px, py) : x.moveTo(px, py); pen = true;
-  }
-  x.stroke();
-}
+      <div id="meter">
+        <div id="needle"></div>
+      </div>
 
-connect();
-</script>
+      <div class="controls">
+        <label>
+          Tone Arm
+          <br>
+          <input id="ta" type="range" min="-5" max="5" step="0.01" value="0">
+        </label>
+        <label>
+          Sensitivity (zoom)
+          <br>
+          <input id="sens" type="range" min="0.01" max="5" step="0.01" value="2">
+        </label>
+      </div>
+
+    </section>
+
+    <section>
+
+      <div id="src">
+        <input id="pi" placeholder="raspberrypi.local:8000" spellcheck="false">
+        <button id="go" class="btn">connect</button>
+      </div>
+
+      <div id="st">connecting</div>
+
+      <div id="readout"><span id="unit">µS</span>: <span id="us">—</span> &nbsp; baseline: <span
+          id="baseline-readout">—</span></div>
+
+      <label><input type="checkbox" id="nano"> nS (nano) instead of µS</label>
+
+      <canvas id="poly" width="320" height="80"></canvas>
+
+    </section>
+
+  </main>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const needle = $("needle");
+
+    // ── controls ──
+    let toneArm = 0;
+    let sensitivity = 2;
+    $("ta").oninput = e => { toneArm = parseFloat(e.target.value); };
+    $("sens").oninput = e => { sensitivity = parseFloat(e.target.value); };
+
+    // ── needle state ──
+    // dt-aware EMAs driven by the stream's own timestamps (d.t, seconds), so
+    // drift rate is in real seconds no matter how the network batches frames,
+    // and a backfill replay rebuilds exactly the state a live run would have.
+    const SMOOTH_TAU_S = 0.15;   // fast tracker: needle responsiveness
+    const BASELINE_TAU_S = 20;   // slow tonic tracker: "where is home"
+
+    let baseline = null;
+    let smooth = null;
+    let lastFrameT = null;       // ms, stream time
+    let lastG = null;            // raw reading, uS
+
+    function updateNeedle(g, tMs) {
+      const dt = lastFrameT === null ? 0.05 : Math.max((tMs - lastFrameT) / 1000, 0.001);
+      lastFrameT = tMs;
+
+      if (smooth === null) smooth = g;
+      if (baseline === null) baseline = g;
+
+      smooth += (g - smooth) * Math.min(dt / SMOOTH_TAU_S, 1);
+      baseline += (g - baseline) * Math.min(dt / BASELINE_TAU_S, 1);
+
+      const drive = (smooth - baseline) * sensitivity;
+      const final = Math.max(-1, Math.min(1, -drive + toneArm));
+      needle.style.transform = `rotate(${-90 + (final + 1) * 90}deg)`;
+    }
+
+    // ── units (display only: needle, baseline and plot all work in uS) ──
+    try { $("nano").checked = localStorage.nano === "1"; } catch (e) { }
+    $("nano").onchange = () => {
+      try { localStorage.nano = $("nano").checked ? "1" : "0"; } catch (e) { }
+      render();
+    };
+
+    function render() {
+      const n = $("nano").checked, k = n ? 1000 : 1;
+      const f = (x, d) => x == null ? "—" : (x * k).toFixed(n ? 0 : d);
+      $("unit").textContent = n ? "nS" : "µS";
+      $("us").textContent = f(lastG, 2);
+      $("baseline-readout").textContent = f(baseline, 3);
+    }
+
+    // ── polygram (canvas) ──
+    const ctx = $("poly").getContext("2d");
+    const W = 320, H = 80;
+    const WINDOW_MS = 30000;
+    const GAP_MS = 1000;         // break the line across gaps (no-contact frames)
+
+    let polyData = [];           // { t (stream ms), g }
+
+    function updatePolygram(g, tMs) {
+      polyData.push({ t: tMs, g });
+      const cutoff = tMs - WINDOW_MS;
+      let n = 0;
+      while (n < polyData.length && polyData[n].t < cutoff) n++;
+      if (n > 0) polyData.splice(0, n);
+    }
+
+    function renderPolygram() {
+      requestAnimationFrame(renderPolygram);
+      ctx.clearRect(0, 0, W, H);
+      if (polyData.length < 2) return;
+
+      let min = Infinity, max = -Infinity;
+      for (const p of polyData) {
+        if (p.g < min) min = p.g;
+        if (p.g > max) max = p.g;
+      }
+      const pad = Math.max((max - min) * 0.2, 2);
+      const lo = min - pad;
+      const range = (max + pad - lo) || 1;
+
+      const now = polyData[polyData.length - 1].t;
+      const toY = v => H * (1 - (v - lo) / range);
+      const toX = t => W * (1 - (now - t) / WINDOW_MS);
+
+      ctx.beginPath();
+      ctx.strokeStyle = "red";
+      ctx.lineWidth = 1.5;
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      for (let i = 0; i < polyData.length; i++) {
+        const x = toX(polyData[i].t), y = toY(polyData[i].g);
+        const gap = i > 0 && polyData[i].t - polyData[i - 1].t > GAP_MS;
+        (i === 0 || gap) ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+    renderPolygram();
+
+    // ── stream ──
+    // stream.py: GET /stream -> SSE frames {"t": secs, "v": volts, "g": uS | null}
+    let es = null;
+    let lastRx = 0;
+
+    function setStatus(text, cls) {
+      $("st").textContent = text;
+      $("st").className = cls || "";
+    }
+
+    function resetState() {
+      baseline = null;
+      smooth = null;
+      lastFrameT = null;
+      lastG = null;
+      polyData = [];
+      render();
+    }
+
+    function connect() {
+      let a = $("pi").value.trim();
+      if (!a) return;
+      try { localStorage.pi = a; } catch (e) { }
+      if (!/^https?:\/\//.test(a)) a = "http://" + a;
+      if (es) es.close();
+      resetState();
+      lastRx = 0;
+      setStatus("connecting", "warn");
+
+      es = new EventSource(a.replace(/\/+$/, "") + "/stream");
+
+      // the server replays the last 60 s on every (re)connect, so start clean
+      es.onopen = () => { resetState(); setStatus("connected", "live"); };
+
+      es.onmessage = e => {
+        const d = JSON.parse(e.data);
+        lastRx = performance.now();
+        lastG = d.g;
+        if (d.g == null) {
+          setStatus("no contact / out of range", "warn");
+        } else {
+          setStatus("live", "live");
+          updateNeedle(d.g, d.t * 1000);
+          updatePolygram(d.g, d.t * 1000);
+        }
+        render();
+      };
+
+      es.onerror = () => setStatus("stream lost, retrying", "bad");
+    }
+
+    // address: ?pi=host:port, else last used, else default
+    let saved = "";
+    try { saved = localStorage.pi || ""; } catch (e) { }
+    $("pi").value = new URLSearchParams(location.search).get("pi") || saved || "raspberrypi.local:8000";
+    $("go").onclick = connect;
+    $("pi").onkeydown = e => { if (e.key === "Enter") connect(); };
+
+    // a frozen needle must never look like a flat signal
+    setInterval(() => {
+      if (lastRx && performance.now() - lastRx > 2000) setStatus("no data", "bad");
+    }, 500);
+
+    render();
+    connect();
+  </script>
+
+</body>
+
+</html>
