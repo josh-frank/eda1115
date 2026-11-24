@@ -22,7 +22,11 @@ POST /record/start  start recording to <outdir>/<timestamp>.srt   (idempotent)
 POST /record/stop   stop and write the .srt                       (idempotent)
 
 The .srt matches elron's: one cue per sample, text = uS (4 decimals) or OPEN for
-no contact. Samples stream to a .raw.csv first, so a power cut loses nothing: any
+no contact. Cue 0, at a negative timestamp, holds the detector params in effect
+(TOML in the cue text; see elron1115.srt_header) so a session can be reproduced.
+Pick a param profile with --profile (default.elron1115.toml if present); --set
+NAME=VALUE overrides single params on top.
+Samples stream to a .raw.csv first, so a power cut loses nothing: any
 leftover .raw.csv is converted to .srt the next time this starts.
 """
 import argparse
@@ -32,12 +36,14 @@ import queue
 import threading
 import time
 from collections import deque
+from dataclasses import asdict
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from smbus2 import SMBus
 
-from elron1115 import Detector
+from elron1115 import (Detector, Params, add_profile_args, params_from_args,
+                       profile_label, srt_header)
 
 ADDR = 0x48                # ADS1115 default (ADDR pin to GND)
 REG_CONV, REG_CONFIG = 0x00, 0x01
@@ -60,7 +66,13 @@ ap.add_argument("--outdir", default="sessions",
 ap.add_argument("--origin", default="*",
                 help="Access-Control-Allow-Origin value; set to your page's origin to "
                      "stop other web pages from reading the stream or starting recordings")
+add_profile_args(ap)
 args = ap.parse_args()
+try:
+    params = params_from_args(args)                    # defaults < profile TOML < --set
+except (ValueError, FileNotFoundError) as e:
+    ap.error(str(e))
+PROFILE = profile_label(args.profile)
 
 T0 = time.monotonic()
 
@@ -72,6 +84,16 @@ def now():
 
 # ---- session recording ------------------------------------------------------
 OPEN = "OPEN"              # cue text for out of range / no contact
+PARAMS_TAG = "#params "    # first line of a .raw.csv: the params in effect, as JSON
+
+
+def header_from_raw(js):
+    """JSON from a raw log's #params line -> SRT header cue ('' if unreadable)."""
+    try:
+        d = json.loads(js)
+        return srt_header(Params(**d["params"]), label=d["profile"])
+    except (ValueError, TypeError, KeyError):
+        return ""
 
 
 def srt_time(ms):
@@ -84,9 +106,12 @@ def srt_time(ms):
 def raw_to_srt(raw_path, end_ms=None):
     """'ms,value' raw log -> .srt. Each cue lasts until the next sample; the last
     lasts until end_ms (or one sample period). -> (srt path or None, cue count)."""
-    rows = []
+    rows, header = [], ""
     with open(raw_path) as f:
         for line in f:
+            if line.startswith(PARAMS_TAG):
+                header = header_from_raw(line[len(PARAMS_TAG):])
+                continue
             ms, _, val = line.rstrip("\n").partition(",")
             if ms.isdigit():                       # skips a torn last line
                 rows.append((int(ms), val or OPEN))
@@ -95,6 +120,7 @@ def raw_to_srt(raw_path, end_ms=None):
     srt_path = raw_path[: -len(".raw.csv")] + ".srt"
     tick = round(1000 / args.hz)
     with open(srt_path, "w", encoding="utf-8") as out:
+        out.write(header)                              # cue 0: params, before t=0
         for i, (ms, val) in enumerate(rows):
             end = rows[i + 1][0] if i + 1 < len(rows) else (end_ms or ms + tick)
             end = max(end, ms + 1)
@@ -139,6 +165,9 @@ class Recorder:
                 stem = f"{base}_{n}"
             self.raw_path = stem + ".raw.csv"
             self.f = open(self.raw_path, "w")
+            self.f.write(PARAMS_TAG + json.dumps({"profile": PROFILE, "params": asdict(params)},
+                                                 separators=(",", ":")) + "\n")
+            self.f.flush()                             # so a crash right now still keeps it
             self.t0 = now()
             self.last_flush = time.monotonic()
             self.active = True
@@ -172,7 +201,7 @@ class Recorder:
 
 rec = Recorder(args.outdir)
 
-det = Detector()                                       # fed from publish(), i.e. the reader thread only
+det = Detector(params)                                 # fed from publish(), i.e. the reader thread only
 cur = {"state": None, "t": 0.0}                        # last state we announced
 events = deque(maxlen=50)                              # (t_end, encoded "ev" msg) for late joiners
 
@@ -344,6 +373,7 @@ srv = ThreadingHTTPServer((args.host, args.port), Handler)
 srv.daemon_threads = True
 print(f"serving on http://{args.host}:{args.port}  (/stream for SSE)")
 print(f"recordings -> {os.path.abspath(args.outdir)}")
+print(f"params: {PROFILE}" + (f" + {len(args.sets)} override(s)" if args.sets else ""))
 try:
     srv.serve_forever()
 except KeyboardInterrupt:

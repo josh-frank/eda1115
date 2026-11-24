@@ -1,0 +1,23 @@
+# default.toml: detector tunables for elron1115
+# Every key is a field of Params. Anything omitted falls back to the dataclass default.
+# All values are floats (write 2.0, not 2).
+
+# --- setup-dependent: sample rate, noise floor, electrode contact ------------
+smooth_tau_s    = 0.15   # tiny input filter
+flat_pct        = 2.0    # "flat" = within this many % over settle_s
+min_rate_pct_s  = 1.0    # must be moving at least this fast (drift is ~0.25)
+rate_win_s      = 0.5    # window for the peak-speed measurement
+gap_s           = 1.0    # a hole in the data longer than this = lost contact
+slow_tau_s      = 60.0   # slow baseline, logged/displayed as context only
+
+# --- dynamics: how the signal behaves ----------------------------------------
+settle_s        = 3.0    # signal must be flat this long before arming
+onset_window_s  = 12.0   # how far back to look for where a change began
+reversal_frac   = 0.5    # READ closes when this share of it is given back
+stall_s         = 3.0    # a READ closes when it makes no real progress for this long
+read_timeout_s  = 30.0   # a READ can't stay open longer than this
+
+# --- events: what counts as one ----------------------------------------------
+start_pct       = 6.0    # drawdown/drawup that opens a READ
+min_amp_pct     = 8.0    # smaller events are discarded
+rebound_gap_s   = 1.0    # "starts at the previous peak" tolerance

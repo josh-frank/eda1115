@@ -20,9 +20,11 @@ Events that start at the previous event's peak, in the opposite direction, are
 tagged `rebound`: structure only, filter them if you don't want them.
 
 Use:
-    from elron import Detector, Params, params_from_sets
+    from elron1115 import Detector, load_params, srt_header
 
-    det = Detector()                         # or Detector(params_from_sets(["start_pct=8"]))
+    det = Detector(load_params())            # ./default.elron1115.toml, else built-in defaults
+    det = Detector(load_params("cans"))      # ./cans.elron1115.toml (or a path to any .toml)
+    det = Detector(load_params(sets=["start_pct=8"]))   # --set style overrides on top
     ...
     ev = det.feed(t, g)                      # t: seconds (any origin), g: uS or None
     det.state                                # "IDLE" | "ARM" | "READ"   (after each feed)
@@ -46,9 +48,12 @@ Notes:
   * Not thread-safe: call feed() from one thread (the reader).
 """
 import bisect
+import json
 import math
+import tomllib                      # Python 3.11+; on older: `import tomli as tomllib`
 from collections import deque
 from dataclasses import dataclass, fields
+from pathlib import Path
 
 IDLE, ARM, READ = "IDLE", "ARM", "READ"
 
@@ -274,9 +279,53 @@ class Detector:
         return ev if abs(ev.amp_pct) >= p.min_amp_pct else None
 
 
-def params_from_sets(sets):
-    """["start_pct=8", "min_rate_pct_s=2"] -> Params. Raises ValueError on a bad name."""
-    p, names = Params(), {f.name for f in fields(Params)}
+# --- profiles: params from TOML, then --set overrides -------------------------
+# Precedence, lowest to highest: dataclass defaults < TOML profile < --set overrides.
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_PROFILE = BASE_DIR / "default.elron1115.toml"
+PROFILE_SUFFIX = ".elron1115.toml"
+
+
+def resolve_profile(profile=None):
+    """-> Path of the TOML file to use, or None for the built-in defaults.
+
+    profile=None   -> default.elron1115.toml next to this file, if it exists, else None.
+    "cans"         -> cans.elron1115.toml next to this file.
+    anything else  -> treated as a path (absolute, or relative to the working directory).
+    An explicitly requested profile that doesn't exist raises FileNotFoundError.
+    """
+    if profile is None:
+        return DEFAULT_PROFILE if DEFAULT_PROFILE.is_file() else None
+    prof = str(profile)
+    if "/" not in prof and "\\" not in prof and not prof.endswith(".toml"):
+        path = BASE_DIR / (prof + PROFILE_SUFFIX)
+    else:
+        path = Path(prof).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"profile {profile!r} not found (looked for {path})")
+    return path
+
+
+def params_from_toml(path, base=None):
+    """Flat TOML of overrides -> Params, applied on top of `base` (or the defaults).
+    Raises ValueError on an unknown name or a non-numeric value."""
+    with open(path, "rb") as fh:                    # tomllib wants binary mode
+        data = tomllib.load(fh)
+    p, names = base or Params(), {f.name for f in fields(Params)}
+    unknown = sorted(set(data) - names)
+    if unknown:
+        raise ValueError(f"{path}: unknown parameter(s) {unknown}; choices: {', '.join(sorted(names))}")
+    for k, v in data.items():
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            raise ValueError(f"{path}: {k} must be a number, got {v!r}")
+        setattr(p, k, float(v))
+    return p
+
+
+def params_from_sets(sets, base=None):
+    """["start_pct=8", "min_rate_pct_s=2"] -> Params, on top of `base` (or the defaults).
+    Raises ValueError on a bad name."""
+    p, names = base or Params(), {f.name for f in fields(Params)}
     for item in sets or []:
         k, _, v = item.partition("=")
         k = k.strip().lower()
@@ -284,3 +333,66 @@ def params_from_sets(sets):
             raise ValueError(f"unknown parameter {k!r}; choices: {', '.join(sorted(names))}")
         setattr(p, k, float(v))
     return p
+
+
+def load_params(profile=None, sets=None):
+    """The whole stack: defaults < TOML profile < --set overrides. -> Params."""
+    base = Params()
+    path = resolve_profile(profile)
+    if path is not None:
+        base = params_from_toml(path, base)
+    return params_from_sets(sets, base)
+
+
+def add_profile_args(parser):
+    """Add --profile and --set to an argparse parser; pair with params_from_args()."""
+    parser.add_argument("--profile", metavar="NAME_OR_PATH",
+                        help="TOML profile: a name (NAME.elron1115.toml next to elron1115.py) "
+                             "or a path. Default: default.elron1115.toml")
+    parser.add_argument("--set", dest="sets", action="append", metavar="NAME=VALUE",
+                        help="override one parameter on top of the profile (repeatable)")
+
+
+def params_from_args(args):
+    return load_params(getattr(args, "profile", None), getattr(args, "sets", None))
+
+
+# --- recording header: params as an SRT cue at a negative timestamp ------------
+# SRT has no comment syntax, so the params ride in cue 0, placed before t=0. Negative
+# timestamps aren't valid SRT: lenient parsers (and a plain text reader) cope, strict
+# players may skip or choke on the cue. Tune the two constants if one does.
+SRT_HEADER_START_S = -2.0
+SRT_HEADER_END_S = -1.0
+
+
+def _srt_ts(sec):
+    sign = "-" if sec < 0 else ""
+    ms = round(abs(sec) * 1000)
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{sign}{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def profile_label(profile=None):
+    """Human label for where params came from: the profile filename, or 'built-in defaults'."""
+    path = resolve_profile(profile)
+    return path.name if path else "built-in defaults"
+
+
+def srt_header(params, profile=None, label=None):
+    """The effective params as one SRT cue (index 0, negative timestamps), ending in a
+    blank line. Write it first when a recording starts, before any real cue.
+
+    `profile` is whatever was passed to load_params (None = default); `label` overrides
+    the profile line outright (used when rebuilding a header from a crashed session's log,
+    where the profile file may have changed or gone). The body is valid TOML, so it can be
+    read back with tomllib after dropping the cue's first two lines.
+    """
+    lines = [
+        "# elron1115 params",
+        f"profile = {json.dumps(label if label is not None else profile_label(profile))}",
+    ]
+    lines += [f"{f.name} = {getattr(params, f.name)!r}" for f in fields(Params)]
+    return (f"0\n{_srt_ts(SRT_HEADER_START_S)} --> {_srt_ts(SRT_HEADER_END_S)}\n"
+            + "\n".join(lines) + "\n\n")
