@@ -11,6 +11,10 @@ GET  /stream        Server-Sent Events. Default events are samples:
                     A second event type, "rec", reports recording state:
                         {"on": true, "since": t}  or  {"on": false, "saved": "x.srt", "cues": n}
                     It is sent on connect and whenever recording starts or stops.
+                    A third, "state", reports the detector's state whenever it changes
+                    (and once on connect):  {"state": "IDLE"|"ARM"|"READ", "t": secs}
+                    Events and the sample frames are unchanged; clients that don't
+                    listen for "state" never notice it.
 POST /record/start  start recording to <outdir>/<timestamp>.srt   (idempotent)
 POST /record/stop   stop and write the .srt                       (idempotent)
 
@@ -29,6 +33,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from smbus2 import SMBus
+from elron import Detector
 
 ADDR = 0x48                # ADS1115 default (ADDR pin to GND)
 REG_CONV, REG_CONFIG = 0x00, 0x01
@@ -42,7 +47,7 @@ R_REF, VCC = 100_000, 3.3
 ap = argparse.ArgumentParser()
 ap.add_argument("--host", default="0.0.0.0", help="bind address (default all interfaces)")
 ap.add_argument("--port", type=int, default=8000)
-ap.add_argument("--hz", type=float, default=10.0, help="samples per second (default 10)")
+ap.add_argument("--hz", type=float, default=20.0, help="samples per second (default 20)")
 ap.add_argument("--bus", type=int, default=1, help="I2C bus number (default 1)")
 ap.add_argument("--addr", type=lambda s: int(s, 0), default=ADDR,
                 help="ADS1115 address (default 0x48)")
@@ -163,6 +168,9 @@ class Recorder:
 
 rec = Recorder(args.outdir)
 
+det = Detector()                                       # fed from publish(), i.e. the reader thread only
+cur = {"state": None, "t": 0.0}                        # last state we announced
+
 # ---- fan-out to clients -------------------------------------------------------
 HISTORY_S = 60
 history = deque(maxlen=int(args.hz * HISTORY_S) + 1)   # encoded SSE frames
@@ -187,12 +195,25 @@ def rec_msg(state):
     return f"event: rec\ndata: {json.dumps(state, separators=(',', ':'))}\n\n".encode()
 
 
+def state_msg(state, t):
+    body = json.dumps({"state": state, "t": round(t, 3)}, separators=(",", ":"))
+    return f"event: state\ndata: {body}\n\n".encode()
+
+
 def publish(frame):
     rec.add(frame["t"], frame["g"])
     msg = f"data: {json.dumps(frame, separators=(',', ':'))}\n\n".encode()
+    try:
+        det.feed(frame["t"], frame["g"])               # finished Events are ignored here
+    except Exception as e:                             # a detector bug must never stop the data
+        print(f"detector error: {e!r}; resetting it")
+        det.reset()
     with lock:
         history.append(msg)
         send_all(msg)
+        if det.state != cur["state"]:                  # a transition: tell everyone, once
+            cur["state"], cur["t"] = det.state, frame["t"]
+            send_all(state_msg(cur["state"], cur["t"]))
 
 
 def announce(state):
@@ -273,6 +294,7 @@ class Handler(BaseHTTPRequestHandler):
         with lock:                                     # snapshot + subscribe atomically
             backfill = list(history)
             clients.add(q)
+            st = dict(cur)
         try:
             self.send_response(200)
             self.cors()
@@ -282,6 +304,8 @@ class Handler(BaseHTTPRequestHandler):
             for msg in backfill:
                 self.wfile.write(msg)
             self.wfile.write(rec_msg(rec.state()))
+            if st["state"]:
+                self.wfile.write(state_msg(st["state"], st["t"]))
             self.wfile.flush()
             while True:
                 try:
