@@ -80,6 +80,29 @@ label {
   margin: 10px;
 }
 
+/* ── tone arm ── */
+.ta {
+  margin: 10px;
+}
+
+.ta-row {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  align-items: center;
+  margin-top: 6px;
+}
+
+.ta-row input {
+  width: 12rem;
+}
+
+.ta-row .btn {
+  padding: 2px 12px;
+  user-select: none;
+  touch-action: none;
+}
+
 label .val {
   color: #aaa;
 }

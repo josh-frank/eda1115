@@ -23,11 +23,14 @@
       <div class="ends"><span id="pct-l">—</span><span id="pct-r">—</span></div>
 
       <div class="controls">
-        <label>
+        <div class="ta">
           Tone Arm (scroll): <span class="val" id="ta-v">—</span>
-          <br>
-          <input id="ta" type="range" min="-5" max="5" step="0.01" value="0">
-        </label>
+          <div class="ta-row">
+            <button class="btn" id="ta-dn" title="lower (hold to repeat)">−</button>
+            <input id="ta" type="range" min="-3" max="4.6" step="0.001" value="0">
+            <button class="btn" id="ta-up" title="raise (hold to repeat)">+</button>
+          </div>
+        </div>
         <label>
           Sensitivity (zoom): <span class="val" id="sens-v">—</span>
           <br>
@@ -47,7 +50,7 @@
       <div id="st">connecting</div>
       <div id="note"></div>
 
-      <div id="readout">reading: <span id="us">—</span> &nbsp; baseline: <span id="baseline-readout">—</span></div>
+      <div id="readout">reading: <span id="us">—</span></div>
 
       <div id="menus">
         <label>Display
@@ -97,44 +100,99 @@
     $("disp").value = disp;
 
     // ── controls ──
-    // needle position = (smooth - baseline) * sensitivity + toneArm, full scale = ±1.
-    // So the dial spans ±1/sensitivity uS around the baseline, and the tone arm
-    // slides that window by toneArm/sensitivity uS.
-    let toneArm = 0;
+    // A manual tone arm, like the real thing. `ref` is the conductance (uS) at which
+    // the needle reads centered, and nothing but you ever moves it:
+    //     needle position = (smoothed reading - ref) * sensitivity,   full scale = ±1
+    // so the dial spans ref ± 1/sensitivity uS. Conductance up (resistance falls)
+    // swings the needle right/clockwise. When it pegs, turn the tone arm to re-center.
     let sensitivity = 2;
-    $("ta").oninput = e => { toneArm = parseFloat(e.target.value); render(); };
-    $("sens").oninput = e => { sensitivity = parseFloat(e.target.value); render(); };
+    $("sens").oninput = e => { sensitivity = parseFloat(e.target.value); placeNeedle(); render(); };
 
     // ── needle state ──
-    // dt-aware EMAs driven by the stream's own timestamps (d.t, seconds), so
-    // drift rate is in real seconds no matter how the network batches frames,
-    // and a backfill replay rebuilds exactly the state a live run would have.
-    const SMOOTH_TAU_S = 0.15;   // fast tracker: needle responsiveness
-    const BASELINE_TAU_S = 20;   // slow tonic tracker: "where is home"
+    // A dt-aware EMA driven by the stream's own timestamps (d.t, seconds), so the
+    // smoothing is in real seconds no matter how the network batches frames.
+    const SMOOTH_TAU_S = 0.15;   // needle responsiveness
 
-    let baseline = null;
     let smooth = null;
     let lastFrameT = null;       // ms, stream time of last sample with contact
     let lastG = null;            // raw reading, uS
     let streamT = 0;             // s, stream time of the latest frame of any kind
+    let live = false;            // false while the server replays its backlog on connect
 
     function updateNeedle(g, tMs) {
       const dt = lastFrameT === null ? 0.05 : Math.max((tMs - lastFrameT) / 1000, 0.001);
       lastFrameT = tMs;
 
       if (smooth === null) smooth = g;
-      if (baseline === null) baseline = g;
-
       smooth += (g - smooth) * Math.min(dt / SMOOTH_TAU_S, 1);
-      baseline += (g - baseline) * Math.min(dt / BASELINE_TAU_S, 1);
 
-      const drive = (smooth - baseline) * sensitivity;
+      if (ref === null && live) setRef(g);     // the very first reading ever: the one automatic act
+      placeNeedle();
+    }
+
+    function placeNeedle() {
+      if (smooth === null || ref === null) return;
       // convention: resistance falls (conductance rises) = needle goes right/clockwise
-      const pos = drive + toneArm;
+      const pos = (smooth - ref) * sensitivity;
       const final = clamp(pos, -1, 1);
       needle.style.transform = `rotate(${-90 + (final + 1) * 90}deg)`;
       ledHit(pos);
     }
+
+    // ── tone arm (manual; the only thing that ever moves `ref`) ──
+    // Controls: slider (coarse, log scale), +/- buttons (fine, hold to repeat),
+    // mouse wheel over the dial (1% a notch, Shift = 5%). "Up" always means up in the
+    // displayed unit, so in the Ω view the slider and wheel run the other way.
+    const REF_MIN = 1e-3, REF_MAX = 1e4;                      // uS
+    const SL_MIN = Math.log(0.05), SL_MAX = Math.log(100);    // slider span, uS (log)
+    let ref = (() => {                                        // survives reloads and reconnects
+      try { const v = parseFloat(localStorage.ref); return v > 0 ? v : null; } catch (e) { return null; }
+    })();
+    const dir = () => units === "r" ? -1 : 1;
+
+    function syncSlider() {
+      const s = $("ta"), d = dir();
+      s.min = d > 0 ? SL_MIN : -SL_MAX;
+      s.max = d > 0 ? SL_MAX : -SL_MIN;
+      if (ref !== null) s.value = d * Math.log(ref);
+    }
+    function setRef(x, fromSlider) {
+      ref = clamp(x, REF_MIN, REF_MAX);
+      save("ref", ref);
+      if (!fromSlider) syncSlider();
+      placeNeedle();
+      render();
+    }
+    function stepRef(pct) {                                   // + raises, - lowers (displayed unit)
+      if (ref === null) return;
+      const f = 1 + pct / 100;
+      setRef(dir() > 0 ? ref * f : ref / f);
+    }
+    $("ta").oninput = e => setRef(Math.exp(dir() * parseFloat(e.target.value)), true);
+
+    $("dial").addEventListener("wheel", e => {
+      e.preventDefault();
+      const dy = e.deltaY * (e.deltaMode === 1 ? 33 : 1);     // lines -> pixels (Firefox)
+      stepRef(-Math.sign(dy) * (e.shiftKey ? 5 : 1) * Math.min(Math.abs(dy) / 100, 1));
+    }, { passive: false });
+
+    function holdRepeat(btn, sign) {
+      let delay = null, timer = null, n = 0;
+      const stop = () => { clearTimeout(delay); clearInterval(timer); };
+      btn.onpointerdown = e => {
+        e.preventDefault();
+        stop();
+        n = 0;
+        stepRef(sign * 0.25);
+        delay = setTimeout(() => {
+          timer = setInterval(() => stepRef(sign * (++n > 25 ? 1 : 0.25)), 40);   // speeds up after ~1 s
+        }, 350);
+      };
+      btn.onpointerup = btn.onpointerleave = btn.onpointercancel = stop;
+    }
+    holdRepeat($("ta-up"), +1);
+    holdRepeat($("ta-dn"), -1);
+    syncSlider();
 
     // ── LED bar (same idea as the curses meter) ──
     const NSEG = 41, C = (NSEG - 1) / 2;
@@ -206,11 +264,11 @@
     $("disp").onchange = e => { disp = e.target.value; save("disp", disp); applyDisp(); };
     applyDisp();
 
-    // ── units (display only: needle, baseline and plot all work in uS) ──
+    // ── units (display only: needle, tone arm and plot all work in uS) ──
     // "r" shows resistance = 1/conductance. 1 nS = 1 GΩ, 1 µS = 1 MΩ. Resistance
     // falls as conductance rises, so it is not symmetric: dial ends are shown
     // as two separate changes (right end / left end) rather than a single ±.
-    $("units").onchange = e => { units = e.target.value; save("units", units); render(); };
+    $("units").onchange = e => { units = e.target.value; save("units", units); syncSlider(); render(); };
 
     function fmtG(x) {                       // uS number, curses-style precision
       const a = Math.abs(x);
@@ -232,11 +290,11 @@
       return fmtC(uS);
     }
 
-    // change in resistance if conductance moves from baseline to baseline + d
+    // change in resistance if conductance moves from the tone arm to tone arm + d
     function dR(d) {
-      const g = baseline + d;
+      const g = ref + d;
       if (g <= 0) return Infinity;
-      return 1e6 / g - 1e6 / baseline;
+      return 1e6 / g - 1e6 / ref;
     }
     const showDR = x => x === Infinity ? "+∞" : signed(x, fmtR(Math.abs(x)));
 
@@ -246,29 +304,27 @@
       const a = Math.abs(p);
       return (p < 0 ? MINUS : "+") + (a < 10 ? a.toFixed(1) : Math.round(a)) + "%";
     }
-    // % change from baseline that parks the needle at position pos (-1 left, +1 right)
+    // % change from the tone arm that parks the needle at position pos (-1 left, +1 right).
+    // Fixed by the tone arm and sensitivity: these only change when you turn a knob.
     function endPct(pos) {
-      if (baseline == null || baseline <= 0) return null;
-      const dev = (pos - toneArm) / sensitivity;               // uS from baseline
+      if (ref == null || ref <= 0) return null;
+      const dev = pos / sensitivity;                           // uS from the tone arm
       if (units === "r") {
-        const g = baseline + dev;
-        return g <= 0 ? Infinity : (baseline / g - 1) * 100;   // resistance % change
+        const g = ref + dev;
+        return g <= 0 ? Infinity : (ref / g - 1) * 100;        // resistance % change
       }
-      return dev / baseline * 100;                             // conductance % change
+      return dev / ref * 100;                                  // conductance % change
     }
 
     function render() {
       $("us").textContent = showVal(lastG);
-      $("baseline-readout").textContent = showVal(baseline);
+      $("ta-v").textContent = showVal(ref);                    // the tone arm, in the chosen unit
 
-      const ta = toneArm / sensitivity;                        // uS the tone arm shifts the dial
       const half = 1 / sensitivity;                            // uS from center to dial end
       if (units === "r") {
-        const ok = baseline != null && baseline > 0;
-        $("ta-v").textContent = ok ? showDR(dR(ta)) : "—";
+        const ok = ref != null && ref > 0;
         $("sens-v").textContent = ok ? `${showDR(dR(half))} / ${showDR(dR(-half))}` : "—";
       } else {
-        $("ta-v").textContent = signed(ta, fmtC(Math.abs(ta)));
         $("sens-v").textContent = "±" + fmtC(half);
       }
       $("pct-l").textContent = pctStr(endPct(-1));
@@ -433,8 +489,8 @@
     }
 
     function resetState() {
-      baseline = null;
       smooth = null;
+      live = false;
       lastFrameT = null;
       lastG = null;
       polyData = [];
@@ -478,7 +534,12 @@
         if (recOn) recLabel();
       };
 
-      es.addEventListener("rec", e => applyRec(JSON.parse(e.data)));
+      // the server sends "rec" right after the backlog, so the first one means we're live
+      es.addEventListener("rec", e => {
+        live = true;
+        if (ref === null && lastG != null) setRef(lastG);
+        applyRec(JSON.parse(e.data));
+      });
       es.addEventListener("ev", e => onEvent(JSON.parse(e.data)));
 
       es.onerror = () => setStatus("stream lost, retrying", "bad");
