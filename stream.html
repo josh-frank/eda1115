@@ -14,18 +14,22 @@
 
     <section>
 
-      <div id="meter">
-        <div id="needle"></div>
+      <div id="dial">
+        <div id="meter">
+          <div id="needle"></div>
+        </div>
+        <div id="leds" hidden></div>
       </div>
+      <div class="ends"><span id="pct-l">—</span><span id="pct-r">—</span></div>
 
       <div class="controls">
         <label>
-          Tone Arm
+          Tone Arm (scroll): <span class="val" id="ta-v">—</span>
           <br>
           <input id="ta" type="range" min="-5" max="5" step="0.01" value="0">
         </label>
         <label>
-          Sensitivity (zoom)
+          Sensitivity (zoom): <span class="val" id="sens-v">—</span>
           <br>
           <input id="sens" type="range" min="0.01" max="5" step="0.01" value="2">
         </label>
@@ -41,11 +45,27 @@
       </div>
 
       <div id="st">connecting</div>
+      <div id="note"></div>
 
-      <div id="readout"><span id="unit">µS</span>: <span id="us">—</span> &nbsp; baseline: <span
-          id="baseline-readout">—</span></div>
+      <div id="readout">reading: <span id="us">—</span> &nbsp; baseline: <span id="baseline-readout">—</span></div>
 
-      <label><input type="checkbox" id="nano"> nS (nano) instead of µS</label>
+      <div id="menus">
+        <label>Display
+          <select id="disp">
+            <option value="needle">Needle</option>
+            <option value="glow">LED glow</option>
+            <option value="fill">LED fill</option>
+          </select>
+        </label>
+        <label>Units
+          <select id="units">
+            <option value="u">µS</option>
+            <option value="n">nS</option>
+            <option value="r">Ω (resistance)</option>
+          </select>
+        </label>
+        <button id="rec" class="btn">● REC</button>
+      </div>
 
       <canvas id="poly" width="320" height="80"></canvas>
 
@@ -56,12 +76,28 @@
   <script>
     const $ = id => document.getElementById(id);
     const needle = $("needle");
+    const MINUS = "\u2212";
+    const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+
+    // ── persisted menu choices ──
+    function load(k, d, ok) {
+      try { const v = localStorage[k]; return ok.includes(v) ? v : d; } catch (e) { return d; }
+    }
+    function save(k, v) { try { localStorage[k] = v; } catch (e) { } }
+
+    let units = load("units", "u", ["u", "n", "r"]);          // µS | nS | resistance
+    let disp = load("disp", "needle", ["needle", "glow", "fill"]);
+    $("units").value = units;
+    $("disp").value = disp;
 
     // ── controls ──
+    // needle position = (smooth - baseline) * sensitivity + toneArm, full scale = ±1.
+    // So the dial spans ±1/sensitivity uS around the baseline, and the tone arm
+    // slides that window by toneArm/sensitivity uS.
     let toneArm = 0;
     let sensitivity = 2;
-    $("ta").oninput = e => { toneArm = parseFloat(e.target.value); };
-    $("sens").oninput = e => { sensitivity = parseFloat(e.target.value); };
+    $("ta").oninput = e => { toneArm = parseFloat(e.target.value); render(); };
+    $("sens").oninput = e => { sensitivity = parseFloat(e.target.value); render(); };
 
     // ── needle state ──
     // dt-aware EMAs driven by the stream's own timestamps (d.t, seconds), so
@@ -72,8 +108,9 @@
 
     let baseline = null;
     let smooth = null;
-    let lastFrameT = null;       // ms, stream time
+    let lastFrameT = null;       // ms, stream time of last sample with contact
     let lastG = null;            // raw reading, uS
+    let streamT = 0;             // s, stream time of the latest frame of any kind
 
     function updateNeedle(g, tMs) {
       const dt = lastFrameT === null ? 0.05 : Math.max((tMs - lastFrameT) / 1000, 0.001);
@@ -87,23 +124,149 @@
 
       const drive = (smooth - baseline) * sensitivity;
       // convention: resistance falls (conductance rises) = needle goes right/clockwise
-      const final = Math.max(-1, Math.min(1, drive + toneArm));
+      const pos = drive + toneArm;
+      const final = clamp(pos, -1, 1);
       needle.style.transform = `rotate(${-90 + (final + 1) * 90}deg)`;
+      ledHit(pos);
     }
 
+    // ── LED bar (same idea as the curses meter) ──
+    const NSEG = 41, C = (NSEG - 1) / 2;
+    const leds = [];
+    const ledBr = new Array(NSEG).fill(0);   // glow brightness 0..1, decays
+    let ledHead = null, ledPegged = false;
+    const LED_TRAIL_S = 0.5;                 // how long the glow takes to fade
+    for (let i = 0; i < NSEG; i++) {
+      const d = document.createElement("div");
+      d.className = "led";
+      $("leds").appendChild(d);
+      leds.push({ el: d, css: "" });
+    }
+
+    function ledHit(pos) {
+      const raw = C + Math.round(pos * C);
+      const h = clamp(raw, 0, NSEG - 1);
+      ledPegged = raw < 0 || raw > NSEG - 1;
+      if (ledHead !== null) {                // light the sweep path
+        const lo = Math.min(h, ledHead), hi = Math.max(h, ledHead);
+        for (let i = lo; i <= hi; i++) ledBr[i] = Math.max(ledBr[i], 0.9);
+      }
+      ledBr[h] = 1;
+      ledHead = h;
+    }
+
+    // green / amber / red by distance from center
+    function gradient(f) {
+      const stops = [[0, [0, 220, 90]], [0.5, [255, 200, 0]], [1, [255, 50, 40]]];
+      f = clamp(f, 0, 1);
+      for (let i = 0; i < 2; i++) {
+        const [f0, c0] = stops[i], [f1, c1] = stops[i + 1];
+        if (f <= f1) {
+          const t = (f - f0) / (f1 - f0);
+          return c0.map((a, j) => a + (c1[j] - a) * t);
+        }
+      }
+      return stops[2][1];
+    }
+
+    function ledColor(i, level) {
+      if (i === ledHead) return ledPegged ? "rgb(255,60,50)" : "rgb(255,255,255)";
+      if (level === 0) return "#222";
+      const k = [0.28, 0.55, 1][level - 1];
+      const [r, g, b] = gradient(Math.abs(i - C) / C).map(c => Math.round(c * k));
+      return `rgb(${r},${g},${b})`;
+    }
+
+    function paintLeds() {
+      if (disp === "needle") return;
+      const level = new Array(NSEG).fill(0);
+      if (disp === "glow") {
+        ledBr.forEach((b, i) => { level[i] = b > 0.75 ? 3 : b > 0.45 ? 2 : b > 0.15 ? 1 : 0; });
+      } else if (ledHead !== null) {         // fill: solid from center to head
+        const lo = Math.min(C, ledHead), hi = Math.max(C, ledHead);
+        for (let i = lo; i <= hi; i++) level[i] = 3;
+      }
+      leds.forEach((l, i) => {
+        const css = ledColor(i, level[i]);
+        if (css !== l.css) { l.css = css; l.el.style.background = css; }
+      });
+    }
+
+    function applyDisp() {
+      const led = disp !== "needle";
+      $("meter").hidden = led;
+      $("leds").hidden = !led;
+    }
+    $("disp").onchange = e => { disp = e.target.value; save("disp", disp); applyDisp(); };
+    applyDisp();
+
     // ── units (display only: needle, baseline and plot all work in uS) ──
-    try { $("nano").checked = localStorage.nano === "1"; } catch (e) { }
-    $("nano").onchange = () => {
-      try { localStorage.nano = $("nano").checked ? "1" : "0"; } catch (e) { }
-      render();
-    };
+    // "r" shows resistance = 1/conductance. 1 nS = 1 GΩ, 1 µS = 1 MΩ. Resistance
+    // falls as conductance rises, so it is not symmetric: dial ends are shown
+    // as two separate changes (right end / left end) rather than a single ±.
+    $("units").onchange = e => { units = e.target.value; save("units", units); render(); };
+
+    function fmtG(x) {                       // uS number, curses-style precision
+      const a = Math.abs(x);
+      return a < 10 ? x.toFixed(3) : a < 100 ? x.toFixed(2) : a < 1000 ? x.toFixed(1) : x.toFixed(0);
+    }
+    function fmtR(ohm) {                     // auto-prefixed ohms
+      if (!isFinite(ohm)) return "∞ Ω";
+      const a = Math.abs(ohm);
+      const [d, p] = a >= 1e9 ? [1e9, "G"] : a >= 1e6 ? [1e6, "M"] : a >= 1e3 ? [1e3, "k"] : [1, ""];
+      const v = ohm / d, av = Math.abs(v);
+      return (av < 10 ? v.toFixed(2) : av < 100 ? v.toFixed(1) : v.toFixed(0)) + " " + p + "Ω";
+    }
+    const fmtC = uS => units === "n" ? Math.round(uS * 1000) + " nS" : fmtG(uS) + " µS";
+    const signed = (x, s) => (x < 0 ? MINUS : "+") + s;       // s = formatted magnitude
+
+    function showVal(uS) {                   // an absolute reading in the chosen unit
+      if (uS == null) return "—";
+      if (units === "r") return uS > 0 ? fmtR(1e6 / uS) : "∞ Ω";
+      return fmtC(uS);
+    }
+
+    // change in resistance if conductance moves from baseline to baseline + d
+    function dR(d) {
+      const g = baseline + d;
+      if (g <= 0) return Infinity;
+      return 1e6 / g - 1e6 / baseline;
+    }
+    const showDR = x => x === Infinity ? "+∞" : signed(x, fmtR(Math.abs(x)));
+
+    function pctStr(p) {
+      if (p === null) return "—";
+      if (!isFinite(p)) return (p > 0 ? "+" : MINUS) + "∞%";
+      const a = Math.abs(p);
+      return (p < 0 ? MINUS : "+") + (a < 10 ? a.toFixed(1) : Math.round(a)) + "%";
+    }
+    // % change from baseline that parks the needle at position pos (-1 left, +1 right)
+    function endPct(pos) {
+      if (baseline == null || baseline <= 0) return null;
+      const dev = (pos - toneArm) / sensitivity;               // uS from baseline
+      if (units === "r") {
+        const g = baseline + dev;
+        return g <= 0 ? Infinity : (baseline / g - 1) * 100;   // resistance % change
+      }
+      return dev / baseline * 100;                             // conductance % change
+    }
 
     function render() {
-      const n = $("nano").checked, k = n ? 1000 : 1;
-      const f = (x, d) => x == null ? "—" : (x * k).toFixed(n ? 0 : d);
-      $("unit").textContent = n ? "nS" : "µS";
-      $("us").textContent = f(lastG, 2);
-      $("baseline-readout").textContent = f(baseline, 3);
+      $("us").textContent = showVal(lastG);
+      $("baseline-readout").textContent = showVal(baseline);
+
+      const ta = toneArm / sensitivity;                        // uS the tone arm shifts the dial
+      const half = 1 / sensitivity;                            // uS from center to dial end
+      if (units === "r") {
+        const ok = baseline != null && baseline > 0;
+        $("ta-v").textContent = ok ? showDR(dR(ta)) : "—";
+        $("sens-v").textContent = ok ? `${showDR(dR(half))} / ${showDR(dR(-half))}` : "—";
+      } else {
+        $("ta-v").textContent = signed(ta, fmtC(Math.abs(ta)));
+        $("sens-v").textContent = "±" + fmtC(half);
+      }
+      $("pct-l").textContent = pctStr(endPct(-1));
+      $("pct-r").textContent = pctStr(endPct(1));
     }
 
     // ── polygram (canvas) ──
@@ -123,7 +286,6 @@
     }
 
     function renderPolygram() {
-      requestAnimationFrame(renderPolygram);
       ctx.clearRect(0, 0, W, H);
       if (polyData.length < 2) return;
 
@@ -152,10 +314,62 @@
       }
       ctx.stroke();
     }
-    renderPolygram();
+
+    // one animation loop: fade the LED glow, repaint LEDs and polygram
+    let lastPaint = performance.now();
+    function frame(nowMs) {
+      requestAnimationFrame(frame);
+      const k = Math.exp(-((nowMs - lastPaint) / 1000) / LED_TRAIL_S);
+      lastPaint = nowMs;
+      for (let i = 0; i < NSEG; i++) ledBr[i] *= k;
+      paintLeds();
+      renderPolygram();
+    }
+    requestAnimationFrame(frame);
+
+    // ── recording (the Pi does the recording; this just asks it to) ──
+    let base = "";               // http://host:port of the stream server
+    let recOn = false, recSince = null;
+    let noteTimer = null;
+
+    function showNote(text, cls) {
+      $("note").textContent = text;
+      $("note").className = cls || "";
+      clearTimeout(noteTimer);
+      noteTimer = setTimeout(() => { $("note").textContent = ""; }, 10000);
+    }
+
+    function recLabel() {
+      if (!recOn) { $("rec").textContent = "● REC"; return; }
+      const s = Math.max(0, Math.floor(streamT - (recSince || 0)));
+      $("rec").textContent = `● REC ${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+    }
+
+    function applyRec(s) {
+      recOn = !!s.on;
+      recSince = s.since == null ? null : s.since;
+      $("rec").classList.toggle("rec-on", recOn);
+      recLabel();
+      if (!recOn && "cues" in s) {
+        showNote(s.saved ? `saved ${s.saved} on the Pi (${s.cues} cues)` : "recording empty, nothing saved");
+      }
+    }
+
+    async function toggleRec() {
+      if (!base) return;
+      try {
+        const r = await fetch(base + (recOn ? "/record/stop" : "/record/start"), { method: "POST" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        applyRec(await r.json());
+      } catch (e) {
+        showNote("record failed: " + e.message, "bad");
+      }
+    }
+    $("rec").onclick = toggleRec;
 
     // ── stream ──
-    // stream.py: GET /stream -> SSE frames {"t": secs, "v": volts, "g": uS | null}
+    // stream.py: GET /stream -> SSE frames {"t": secs, "v": volts, "g": uS | null},
+    // plus "rec" events {"on": bool, ...} when recording starts or stops.
     let es = null;
     let lastRx = 0;
 
@@ -170,20 +384,25 @@
       lastFrameT = null;
       lastG = null;
       polyData = [];
+      ledBr.fill(0);
+      ledHead = null;
+      ledPegged = false;
+      needle.style.transform = "";
       render();
     }
 
     function connect() {
       let a = $("pi").value.trim();
       if (!a) return;
-      try { localStorage.pi = a; } catch (e) { }
+      save("pi", a);
       if (!/^https?:\/\//.test(a)) a = "http://" + a;
+      base = a.replace(/\/+$/, "");
       if (es) es.close();
       resetState();
       lastRx = 0;
       setStatus("connecting", "warn");
 
-      es = new EventSource(a.replace(/\/+$/, "") + "/stream");
+      es = new EventSource(base + "/stream");
 
       // the server replays the last 60 s on every (re)connect, so start clean
       es.onopen = () => { resetState(); setStatus("connected", "live"); };
@@ -191,6 +410,7 @@
       es.onmessage = e => {
         const d = JSON.parse(e.data);
         lastRx = performance.now();
+        streamT = d.t;
         lastG = d.g;
         if (d.g == null) {
           setStatus("no contact / out of range", "warn");
@@ -200,7 +420,10 @@
           updatePolygram(d.g, d.t * 1000);
         }
         render();
+        if (recOn) recLabel();
       };
+
+      es.addEventListener("rec", e => applyRec(JSON.parse(e.data)));
 
       es.onerror = () => setStatus("stream lost, retrying", "bad");
     }

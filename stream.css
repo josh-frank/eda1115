@@ -2,6 +2,10 @@
   color-scheme: dark;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 body {
   background: #111;
   color: #ddd;
@@ -22,11 +26,15 @@ section {
   max-width: 100vw;
 }
 
-/* ── needle ── */
+/* ── dial: needle or LED bar, same footprint so switching doesn't jump ── */
+#dial {
+  width: 320px;
+  margin: 40px auto 0;
+}
+
 #meter {
   width: 320px;
   height: 180px;
-  margin: 40px auto;
   position: relative;
 }
 
@@ -40,6 +48,29 @@ section {
   transform-origin: bottom center;
 }
 
+#leds {
+  height: 56px;
+  margin: 62px 0;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 2px;
+}
+
+.led {
+  background: #222;
+  border-radius: 1px;
+}
+
+/* ± % at each end of the needle / LED bar */
+.ends {
+  width: 320px;
+  margin: 0 auto;
+  display: flex;
+  justify-content: space-between;
+  color: #888;
+}
+
 .controls {
   margin-top: 20px;
 }
@@ -47,6 +78,10 @@ section {
 label {
   display: block;
   margin: 10px;
+}
+
+label .val {
+  color: #aaa;
 }
 
 /* ── source: where the stream comes from ── */
@@ -57,9 +92,8 @@ label {
   margin: 14px auto;
 }
 
-#pi {
-  width: 14rem;
-  max-width: 60%;
+#pi,
+select {
   background: #1a1a1a;
   border: 1px solid #555;
   border-radius: 4px;
@@ -69,7 +103,13 @@ label {
   padding: 4px 8px;
 }
 
-#pi:focus {
+#pi {
+  width: 14rem;
+  max-width: 60%;
+}
+
+#pi:focus,
+select:focus {
   outline: none;
   border-color: #aaa;
 }
@@ -91,6 +131,11 @@ label {
   color: #ddd;
 }
 
+.btn.rec-on {
+  border-color: #f44;
+  color: #f44;
+}
+
 /* ── status + readout ── */
 #st {
   color: #666;
@@ -109,8 +154,32 @@ label {
   color: #c44;
 }
 
+#note {
+  color: #8c8;
+  min-height: 1.5em;
+}
+
+#note.bad {
+  color: #c44;
+}
+
 #readout {
   margin-top: 6px;
+}
+
+/* ── menus ── */
+#menus {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 10px 0;
+}
+
+#menus label {
+  display: inline;
+  margin: 0;
 }
 
 /* ── polygram ── */
