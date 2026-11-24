@@ -1,5 +1,5 @@
 [Unit]
-Description=elron1115 stream (tmux)
+Description=elron1115 server (tmux)
 After=network.target
 
 [Service]
@@ -7,7 +7,7 @@ Type=oneshot
 RemainAfterExit=yes
 User=pi
 WorkingDirectory=/home/pi/elron1115
-ExecStart=/usr/bin/tmux new-session -d -s elron1115 'source /home/pi/elron1115/.venv/bin/activate; while true; do python3 /home/pi/elron1115/stream.py --outdir /home/pi/elron1115/sessions; sleep 2; done'
+ExecStart=/usr/bin/tmux new-session -d -s elron1115 'source /home/pi/elron1115/.venv/bin/activate; while true; do python3 /home/pi/elron1115/serve.py --outdir /home/pi/elron1115/sessions; sleep 2; done'
 ExecStop=/usr/bin/tmux send-keys -t elron1115 C-c
 ExecStop=/bin/sleep 2
 ExecStop=-/usr/bin/tmux kill-session -t elron1115
