@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-elron1115.py: the three-state electrodermography detector, standalone.
+elron1115.py: electrodermography read detection state machine.
 No GUI, no I/O, no threads: feed it samples, it hands back events.
 
     IDLE   no contact, or the signal is still settling. No events are emitted.

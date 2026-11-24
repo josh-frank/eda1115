@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""stream.py: cli.py, but it /streams instead of printing. Data + recording; the UI is stream.html.
+"""elron1115-server.py: cli.py, but it /streams instead of printing. Data + recording; the UI is stream.html.
 
     python3 stream.py                  # serves on :8000, sessions go to ./sessions
     curl -N http://raspberrypi.local:8000/stream
@@ -37,10 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from smbus2 import SMBus
 
-try:
-    from elron2 import Detector
-except ImportError:                    # if you renamed elron2.py to elron.py
-    from elron import Detector
+from elron1115 import Detector
 
 ADDR = 0x48                # ADS1115 default (ADDR pin to GND)
 REG_CONV, REG_CONFIG = 0x00, 0x01
