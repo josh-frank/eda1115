@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>editor</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: #111;
+      color: #ddd;
+      font-family: monospace;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    #toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 12px;
+      border-bottom: 1px solid #333;
+      flex-shrink: 0;
+    }
+
+    #toolbar button,
+    #toolbar label {
+      background: #222;
+      border: 1px solid #444;
+      color: #ddd;
+      font-family: monospace;
+      font-size: 12px;
+      padding: 4px 10px;
+      cursor: pointer;
+    }
+
+    #toolbar button:hover {
+      border-color: #aaa;
+    }
+
+    #toolbar label {
+      cursor: pointer;
+    }
+
+    #time-display {
+      margin-left: auto;
+      font-size: 12px;
+      color: #888;
+    }
+
+    #abs-label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #888;
+    }
+
+    /* main area */
+    #workspace {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* annotation lane */
+    #annotation-lane {
+      flex: 1;
+      position: relative;
+      border-bottom: 1px solid #333;
+      overflow: hidden;
+      cursor: crosshair;
+    }
+
+    .note-block {
+      position: absolute;
+      top: 8px;
+      height: calc(100% - 16px);
+      background: #1a2a1a;
+      border: 1px solid #4a4;
+      border-radius: 2px;
+      overflow: hidden;
+    }
+
+    .note-block textarea {
+      width: 100%;
+      height: 100%;
+      background: transparent;
+      border: none;
+      color: #aea;
+      font-family: monospace;
+      font-size: 11px;
+      resize: none;
+      padding: 4px;
+      cursor: text;
+    }
+
+    .note-block textarea:focus {
+      outline: none;
+    }
+
+    .note-block .close-btn {
+      position: absolute;
+      top: 2px;
+      right: 2px;
+      background: none;
+      border: none;
+      color: #666;
+      cursor: pointer;
+      font-size: 10px;
+      line-height: 1;
+      padding: 0 2px;
+    }
+
+    .note-block .close-btn:hover {
+      color: #f66;
+    }
+
+    /* waveform lane */
+    #waveform-lane {
+      height: 120px;
+      position: relative;
+      flex-shrink: 0;
+      overflow: hidden;
+      cursor: ew-resize;
+    }
+
+    #waveform-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+
+    /* playhead */
+    #playhead {
+      position: absolute;
+      top: 0;
+      width: 1px;
+      background: #f88;
+      pointer-events: none;
+      z-index: 10;
+    }
+
+    #playhead-annotation {
+      height: 100%;
+    }
+
+    #playhead-waveform {
+      height: 100%;
+    }
+
+    #empty {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: #444;
+      font-size: 13px;
+      pointer-events: none;
+    }
+    /* vertical mode */
+    #workspace.vertical {
+      flex-direction: row;
+    }
+
+    #workspace.vertical #annotation-lane {
+      flex: 1;
+      border-bottom: none;
+      border-right: 1px solid #333;
+      cursor: crosshair;
+    }
+
+    #workspace.vertical #waveform-lane {
+      width: 120px;
+      height: auto;
+      flex-shrink: 0;
+      cursor: ns-resize;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div id="toolbar">
+    <label>
+      <input type="file" id="file-input" accept=".srt" style="display:none">
+      open srt
+    </label>
+    <button id="save-btn" disabled>save srt</button>
+    <button id="export-btn" disabled>export jsonl</button>
+    <button id="flip-btn">flip ↕</button>
+    <label id="abs-label">
+      <input type="checkbox" id="abs-check"> absolute scale
+    </label>
+    <div id="time-display">—</div>
+  </div>
+
+  <div id="workspace">
+    <div id="annotation-lane">
+      <div id="playhead" id="playhead-annotation" style="display:none"></div>
+      <div id="empty">open an srt file to begin</div>
+    </div>
+    <div id="waveform-lane">
+      <canvas id="waveform-canvas"></canvas>
+      <div id="playhead" style="display:none"></div>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script>
+    // --- state ---
+    let frames = [];       // [{t_ms, end_ms, nS}]  nS is null for OPEN (no contact) cues
+    let decimals = 1;      // digits per value, kept from the loaded file
+    let notes = [];        // [{id, t0, t1, text, read}]
+    let sessionName = '';
+    let viewStart = 0;     // ms
+    let viewEnd = 0;       // ms
+    let absScale = false;
+    let globalMin = 0, globalMax = 1;
+    let dragging = null;   // {startX, startT}
+    let dragNote = null;   // in-progress note block el
+    let nextId = 0;
+    let cursorMs = 0;
+    let verticalMode = false;
+
+    const filePicker = document.getElementById('file-input');
+    const saveBtn = document.getElementById('save-btn');
+    const exportBtn = document.getElementById('export-btn');
+    const absCheck = document.getElementById('abs-check');
+    const timeDisplay = document.getElementById('time-display');
+    const annoLane = document.getElementById('annotation-lane');
+    const wfLane = document.getElementById('waveform-lane');
+    const canvas = document.getElementById('waveform-canvas');
+    const ctx = canvas.getContext('2d');
+
+    // playheads (two separate elements)
+    const phAnno = document.createElement('div');
+    phAnno.style.cssText = 'position:absolute;top:0;width:1px;background:#f88;pointer-events:none;z-index:10;display:none;';
+    annoLane.appendChild(phAnno);
+
+    const phWf = document.createElement('div');
+    phWf.style.cssText = 'position:absolute;top:0;width:1px;background:#f88;pointer-events:none;z-index:10;display:none;';
+    wfLane.appendChild(phWf);
+
+    // --- SRT parse ---
+    function parseSRT(text) {
+      const edaFrames = [];
+      let maxDec = 0;
+      const savedNotes = [];
+      const blocks = text.trim().split(/\n\s*\n/);
+      for (const block of blocks) {
+        const lines = block.trim().split('\n');
+        if (lines.length < 3) continue;
+        const tc = lines[1].split('-->');
+        if (tc.length < 2) continue;
+        const t0 = tcToMs(tc[0].trim());
+        const t1 = tcToMs(tc[1].trim());
+        const contentLines = lines.slice(2);
+
+        // note block: no pipe, has [text]
+        const noteMatch = contentLines.join('\n').match(/^\[([^]*)\](\s*READ)?$/);
+        if (noteMatch) {
+          savedNotes.push({ id: nextId++, t0, t1, text: noteMatch[1].replace(/\\n/g, '\n'), read: !!noteMatch[2] });
+          continue;
+        }
+
+        // EDA frame: a bare nS value, or OPEN (out of range / no contact)
+        const val = contentLines.join('\n').trim();
+        if (val === 'OPEN') {
+          edaFrames.push({ t_ms: t0, end_ms: t1, nS: null });
+          continue;
+        }
+        const m = val.match(/^(-?\d+(?:\.\d+)?)$/);
+        if (!m) continue;
+        maxDec = Math.max(maxDec, (m[1].split('.')[1] || '').length);
+        edaFrames.push({ t_ms: t0, end_ms: t1, nS: parseFloat(m[1]) });
+      }
+      return { edaFrames, savedNotes, maxDec };
+    }
+
+    function tcToMs(tc) {
+      // HH:MM:SS,mmm
+      const [hms, ms] = tc.split(',');
+      const [h, m, s] = hms.split(':').map(Number);
+      return ((h * 3600 + m * 60 + s) * 1000) + (parseInt(ms) || 0);
+    }
+
+    function msToTc(ms) {
+      ms = Math.round(ms);
+      const h = Math.floor(ms / 3600000); ms %= 3600000;
+      const m = Math.floor(ms / 60000); ms %= 60000;
+      const s = Math.floor(ms / 1000); ms %= 1000;
+      return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms, 3)}`;
+    }
+
+    function pad(n, w = 2) { return String(n).padStart(w, '0'); }
+
+    // min/max of the non-OPEN values (loops, not Math.min(...), so long sessions don't overflow the stack)
+    function minMax(list) {
+      let lo = Infinity, hi = -Infinity;
+      for (const f of list) {
+        if (f.nS === null) continue;
+        if (f.nS < lo) lo = f.nS;
+        if (f.nS > hi) hi = f.nS;
+      }
+      return [lo, hi];
+    }
+
+    // --- load ---
+    filePicker.onchange = e => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = ev => {
+        const parsed = parseSRT(ev.target.result);
+        frames = parsed.edaFrames;
+        if (!frames.some(f => f.nS !== null)) return;
+        decimals = parsed.maxDec;
+        notes = parsed.savedNotes;
+        sessionName = file.name.replace(/\.srt$/i, '');
+        viewStart = frames[0].t_ms;
+        viewEnd = frames[frames.length - 1].t_ms;
+        [globalMin, globalMax] = minMax(frames);
+        document.getElementById('empty').style.display = 'none';
+        saveBtn.disabled = false;
+        exportBtn.disabled = false;
+        render();
+      };
+      reader.readAsText(file);
+    };
+
+    // toolbar label click -> file input
+    document.querySelector('label').onclick = () => filePicker.click();
+
+    absCheck.onchange = () => { absScale = absCheck.checked; render(); };
+
+    document.getElementById('flip-btn').onclick = () => {
+      verticalMode = !verticalMode;
+      document.getElementById('workspace').classList.toggle('vertical', verticalMode);
+      document.getElementById('flip-btn').textContent = verticalMode ? 'flip ↔' : 'flip ↕';
+      if (frames.length) render();
+    };
+
+    // --- coordinate helpers ---
+    function laneSize(lane) {
+      return verticalMode ? lane.clientHeight : lane.clientWidth;
+    }
+
+    function msToX(ms, laneW) {
+      return (ms - viewStart) / (viewEnd - viewStart) * laneW;
+    }
+
+    function xToMs(x, laneW) {
+      return viewStart + (x / laneW) * (viewEnd - viewStart);
+    }
+
+    // --- render waveform ---
+    function renderWaveform() {
+      const W = wfLane.clientWidth;
+      const H = wfLane.clientHeight;
+      canvas.width = W;
+      canvas.height = H;
+      ctx.clearRect(0, 0, W, H);
+
+      if (!frames.length) return;
+
+      const vis = frames.filter(f => f.t_ms >= viewStart && f.t_ms <= viewEnd);
+      if (vis.length < 2) return;
+
+      const [visLo, visHi] = minMax(vis);
+      if (visLo === Infinity) return;
+      const lo = absScale ? globalMin : visLo;
+      const hi = absScale ? globalMax : visHi;
+      const range = (hi - lo) || 1;
+
+      ctx.strokeStyle = 'red';
+      ctx.lineWidth = 1.5;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+
+      if (verticalMode) {
+        // time runs top→bottom, amplitude left→right
+        let pen = false;   // OPEN cues break the line
+        vis.forEach(f => {
+          if (f.nS === null) { pen = false; return; }
+          const y = msToX(f.t_ms, H);
+          const x = ((f.nS - lo) / range) * (W - 8) + 4;
+          pen ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+          pen = true;
+        });
+      } else {
+        let pen = false;
+        vis.forEach(f => {
+          if (f.nS === null) { pen = false; return; }
+          const x = msToX(f.t_ms, W);
+          const y = H - ((f.nS - lo) / range) * (H - 8) - 4;
+          pen ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+          pen = true;
+        });
+      }
+      ctx.stroke();
+    }
+
+    // --- render note blocks ---
+    function renderNotes() {
+      const W = annoLane.clientWidth;
+      const H = annoLane.clientHeight;
+      const span = verticalMode ? H : W;
+      annoLane.querySelectorAll('.note-block').forEach(el => el.remove());
+      for (const note of notes) {
+        const p0 = msToX(note.t0, span);
+        const p1 = msToX(note.t1, span);
+        if (p1 < 0 || p0 > span) continue;
+        const el = document.createElement('div');
+        el.className = 'note-block';
+
+        if (verticalMode) {
+          el.style.cssText = `position:absolute;left:8px;width:calc(100% - 16px);top:${p0}px;height:${p1 - p0}px;background:#1a2a1a;border:1px solid #4a4;border-radius:2px;overflow:hidden;`;
+        } else {
+          el.style.left = p0 + 'px';
+          el.style.width = (p1 - p0) + 'px';
+        }
+        el.dataset.id = note.id;
+
+        const ta = document.createElement('textarea');
+        ta.value = note.text;
+        ta.placeholder = 'annotate…';
+        ta.onclick = e => e.stopPropagation();
+        ta.oninput = e => { note.text = e.target.value; };
+        el.appendChild(ta);
+
+        const readCb = document.createElement('input');
+        readCb.type = 'checkbox';
+        readCb.checked = !!note.read;
+        readCb.title = 'read';
+        readCb.style.cssText = 'position:absolute;bottom:4px;left:4px;cursor:pointer;';
+        readCb.onclick = e => e.stopPropagation();
+        readCb.onchange = e => { note.read = e.target.checked; };
+        el.appendChild(readCb);
+
+        const cb = document.createElement('button');
+        cb.className = 'close-btn';
+        cb.textContent = '×';
+        cb.onclick = e => {
+          e.stopPropagation();
+          notes = notes.filter(n => n.id !== note.id);
+          render();
+        };
+        el.appendChild(cb);
+        annoLane.appendChild(el);
+      }
+    }
+
+    function render() {
+      renderWaveform();
+      renderNotes();
+      updatePlayhead();
+    }
+
+    function updatePlayhead() {
+      const W = annoLane.clientWidth;
+      const H = annoLane.clientHeight;
+      if (verticalMode) {
+        const y = msToX(cursorMs, H);
+        if (y >= 0 && y <= H) {
+          phAnno.style.display = 'block';
+          phAnno.style.left = '0'; phAnno.style.top = y + 'px';
+          phAnno.style.width = annoLane.clientWidth + 'px'; phAnno.style.height = '1px';
+          phWf.style.display = 'block';
+          phWf.style.left = '0'; phWf.style.top = y + 'px';
+          phWf.style.width = wfLane.clientWidth + 'px'; phWf.style.height = '1px';
+        }
+      } else {
+        const x = msToX(cursorMs, W);
+        if (x >= 0 && x <= W) {
+          phAnno.style.display = 'block';
+          phAnno.style.left = x + 'px'; phAnno.style.top = '0';
+          phAnno.style.width = '1px'; phAnno.style.height = annoLane.clientHeight + 'px';
+          phWf.style.display = 'block';
+          phWf.style.left = x + 'px'; phWf.style.top = '0';
+          phWf.style.width = '1px'; phWf.style.height = wfLane.clientHeight + 'px';
+        }
+      }
+      timeDisplay.textContent = msToTc(cursorMs);
+    }
+
+    // --- annotation lane: click-drag to create note ---
+    let dragStart = null;
+
+    annoLane.onmousedown = e => {
+      if (e.target !== annoLane) return;
+      const span = verticalMode ? annoLane.clientHeight : annoLane.clientWidth;
+      const pos = verticalMode ? e.offsetY : e.offsetX;
+      dragStart = { x: pos, ms: xToMs(pos, span) };
+    };
+
+    annoLane.onmousemove = e => {
+      if (!frames.length) return;
+      if (e.target !== annoLane) return;
+      const span = verticalMode ? annoLane.clientHeight : annoLane.clientWidth;
+      const pos = verticalMode ? e.offsetY : e.offsetX;
+      cursorMs = xToMs(pos, span);
+      updatePlayhead();
+
+      if (dragStart) {
+        const p0 = Math.min(dragStart.x, pos);
+        const p1 = Math.max(dragStart.x, pos);
+        if (!dragNote) {
+          dragNote = document.createElement('div');
+          dragNote.className = 'note-block';
+          dragNote.style.pointerEvents = 'none';
+          annoLane.appendChild(dragNote);
+        }
+        if (verticalMode) {
+          dragNote.style.cssText = `position:absolute;left:8px;width:calc(100% - 16px);top:${p0}px;height:${p1 - p0}px;background:#1a2a1a;border:1px solid #4a4;border-radius:2px;pointer-events:none;`;
+        } else {
+          dragNote.style.left = p0 + 'px';
+          dragNote.style.width = (p1 - p0) + 'px';
+        }
+      }
+    };
+
+    annoLane.onmouseup = e => {
+      if (!dragStart) return;
+      const span = verticalMode ? annoLane.clientHeight : annoLane.clientWidth;
+      const pos = verticalMode ? e.offsetY : e.offsetX;
+      const ms1 = xToMs(pos, span);
+      const t0 = Math.min(dragStart.ms, ms1);
+      const t1 = Math.max(dragStart.ms, ms1);
+
+      if (dragNote) { dragNote.remove(); dragNote = null; }
+
+      if (t1 - t0 > 200) {
+        notes.push({ id: nextId++, t0, t1, text: '' });
+        render();
+        setTimeout(() => {
+          const last = annoLane.querySelectorAll('.note-block');
+          if (last.length) last[last.length - 1].querySelector('textarea').focus();
+        }, 10);
+      }
+      dragStart = null;
+    };
+
+    // --- waveform lane: pan ---
+    let panStart = null;
+
+    wfLane.onmousedown = e => {
+      panStart = { x: e.clientX, y: e.clientY, vs: viewStart, ve: viewEnd };
+    };
+
+    window.onmousemove = e => {
+      if (!panStart || !frames.length) return;
+      const span = panStart.ve - panStart.vs;
+      const totalStart = frames[0].t_ms;
+      const totalEnd = frames[frames.length - 1].t_ms;
+      let dms;
+      if (verticalMode) {
+        const H = wfLane.clientHeight;
+        const dy = e.clientY - panStart.y;
+        dms = -(dy / H) * span;
+      } else {
+        const W = wfLane.clientWidth;
+        const dx = e.clientX - panStart.x;
+        dms = -(dx / W) * span;
+      }
+      viewStart = Math.max(totalStart, Math.min(panStart.vs + dms, totalEnd - span));
+      viewEnd = viewStart + span;
+      render();
+    };
+
+    window.onmouseup = () => { panStart = null; };
+
+    // --- waveform lane: scroll to zoom ---
+    wfLane.onwheel = e => {
+      if (!frames.length) return;
+      e.preventDefault();
+      const W = wfLane.clientWidth;
+      const H = wfLane.clientHeight;
+      const mouseMs = verticalMode ? xToMs(e.offsetY, H) : xToMs(e.offsetX, W);
+      const span = viewEnd - viewStart;
+      const factor = e.deltaY > 0 ? 1.15 : 0.87;
+      const newSpan = Math.max(2000, Math.min(span * factor, frames[frames.length - 1].t_ms - frames[0].t_ms));
+      const ratio = (mouseMs - viewStart) / span;
+      viewStart = mouseMs - ratio * newSpan;
+      viewEnd = viewStart + newSpan;
+      const totalStart = frames[0].t_ms;
+      const totalEnd = frames[frames.length - 1].t_ms;
+      if (viewStart < totalStart) { viewStart = totalStart; viewEnd = viewStart + newSpan; }
+      if (viewEnd > totalEnd) { viewEnd = totalEnd; viewStart = viewEnd - newSpan; }
+      render();
+    };
+
+    // --- waveform mousemove for playhead ---
+    wfLane.onmousemove = e => {
+      if (!frames.length || panStart) return;
+      const span = verticalMode ? wfLane.clientHeight : wfLane.clientWidth;
+      const pos = verticalMode ? e.offsetY : e.offsetX;
+      cursorMs = xToMs(pos, span);
+      updatePlayhead();
+    };
+
+    // --- save ---
+    saveBtn.onclick = () => {
+      if (!frames.length) return;
+
+      let out = '';
+      let idx = 1;
+
+      // EDA frames — clean, no annotations embedded
+      frames.forEach(f => {
+        const val = f.nS === null ? 'OPEN' : f.nS.toFixed(decimals);
+        out += `${idx++}\n${msToTc(f.t_ms)} --> ${msToTc(f.end_ms)}\n${val}\n\n`;
+      });
+
+      // notes — one block each spanning full drag range
+      notes.forEach(n => {
+        const encoded = n.text.replace(/\n/g, '\\n');
+        out += `${idx++}\n${msToTc(n.t0)} --> ${msToTc(n.t1)}\n[${encoded}]${n.read ? ' READ' : ''}\n\n`;
+      });
+
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([out], { type: 'text/plain' }));
+      a.download = `${sessionName || 'session'}_annotated.srt`;
+      a.hidden = true;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    };
+
+    // --- feature computation ---
+    function computeFeatures(t0, t1) {
+      const window = frames.filter(f => f.t_ms >= t0 && f.t_ms <= t1);
+      if (window.length < 2) return null;
+
+      const valid = window.filter(f => f.nS !== null);
+      if (valid.length < 2) return null;
+      const vals = valid.map(f => f.nS);
+      const [vMin, vMax] = minMax(valid);
+      const amplitude = vMax - vMin;
+
+      // baseline: mean of up to 5 frames before t0
+      const pre = frames.filter(f => f.t_ms < t0 && f.nS !== null).slice(-5);
+      const baseline = pre.length
+        ? pre.reduce((s, f) => s + f.nS, 0) / pre.length
+        : vals[0];
+
+      // peak index
+      const peak = valid[vals.indexOf(vMax)];
+      const attack_s = (peak.t_ms - t0) / 1000;
+      const release_s = (t1 - peak.t_ms) / 1000;
+
+      return {
+        amplitude_nS: +amplitude.toFixed(decimals),
+        attack_s: +attack_s.toFixed(3),
+        release_s: +release_s.toFixed(3),
+        baseline_nS: +baseline.toFixed(decimals)
+      };
+    }
+
+    // --- export jsonl zip ---
+    exportBtn.onclick = async () => {
+      if (!notes.length) return;
+      const zip = new JSZip();
+      for (const n of notes) {
+        const features = computeFeatures(n.t0, n.t1);
+        const obj = {
+          session: sessionName,
+          t0: +(n.t0 / 1000).toFixed(3),
+          t1: +(n.t1 / 1000).toFixed(3),
+          read: !!n.read,
+          note: n.text,
+          features
+        };
+        const filename = `${sessionName}_${n.t0}.jsonl`;
+        zip.file(filename, JSON.stringify(obj));
+      }
+      const blob = await zip.generateAsync({ type: 'blob' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `${sessionName}_annotations.zip`;
+      a.hidden = true;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    };
+
+    // --- resize ---
+    window.onresize = () => { if (frames.length) render(); };
+  </script>
+</body>
+
+</html>
