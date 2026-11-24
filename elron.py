@@ -1,436 +1,286 @@
 #!/usr/bin/env python3
 """
-elron.py: the electropsychometry live read-out node.
+elron.py: the three-state electrodermography detector, standalone.
+No GUI, no I/O, no threads: feed it samples, it hands back events.
 
-Two state machines run in tandem on one stream of conductance readings:
+    IDLE   no contact, or the signal is still settling. No events are emitted.
+    ARM    watching. Any change bigger and faster than the thresholds opens a READ.
+    READ   one monotone excursion is open. It closes when the signal gives back
+           half of it, stops making progress, or times out. Each READ becomes
+           one Event.
 
-  SQUEEZE machine (fast, per-frame)       -> events of kind "squeeze"
-      Watches the frame-to-frame change. A sharp, sudden move arms it
-      (IDLE -> ARMED -> SQUEEZE). It stays in SQUEEZE until the signal goes
-      quiet, then asks: did the level come back to where it started?
-      Yes = a can squeeze (emitted). No = a level shift, which this machine
-      can't judge, so it is NOT emitted: it's the fall machine's territory.
+It only measures: direction (+1 conductance up / -1 conductance down), amplitude
+in %, time to peak, and peak speed in %/s. What an event MEANS is up to you.
+Everything works in log-conductance, so thresholds are percent changes and the
+same settings serve a dry day and a sweaty one.
 
-  FALL machine (slow, windowed)           -> events of kind "fall"
-      Frame-to-frame change is useless for a fall: a fall is big but
-      gradual, and each 50 ms step is lost in the noise. So this machine
-      compares two medians: the last 0.5 s against the 2-4 s that came
-      before. A drop that stays beyond threshold arms it (ARMED -> FALLING).
-      It keeps following the signal down and resolves once it has stopped
-      finding new lows for a few seconds. It reports the size, the speed
-      and how much of the fall came back (the "flutter").
+An excursion ends at its extreme and the next can start right there, so a held
+squeeze is two events (rise, then a fast opposite event starting at the peak).
+Events that start at the previous event's peak, in the opposite direction, are
+tagged `rebound`: structure only, filter them if you don't want them.
 
-Arbitration: both machines see most big moves. If a squeeze was just
-emitted, a fall overlapping it is vetoed, so one physical event gives one
-call. Squeezes win ties because they are the one thing the squeeze machine
-is good at.
+Use:
+    from elron import Detector, Params, params_from_sets
 
-Both machines share one slow baseline (20 s EMA, frozen while an event is
-in progress), exposed as `.baseline`. It doubles as a tracking tone arm.
-
-Direction: internally an "event" is a DROP in the working signal x.
-`sign` maps your readings onto x:
-    sign=+1  events are RISES in the value you feed in. Right for the
-             pimeter's conductance: squeezing the cans lowers resistance, so
-             conductance goes up.
-    sign=-1  events are DROPS in the value. Right for old Arduino-era files
-             like uncle_vic.srt, where the logged value falls on a squeeze.
-All numbers in events are positive magnitudes; levels are in your units.
-
-Units: thresholds are adaptive (multiples of measured noise) except the
-absolute floors, which are written in uS. Pass scale=1000 for nS.
-
-Hook-up in emeter.py (after em.tick() produces a reading g):
-    from elron import Elron
-    elron = Elron(scale=K)                     # K = UNIT_SCALE / 1e6
+    det = Detector()                         # or Detector(params_from_sets(["start_pct=8"]))
     ...
-    for ev in elron.update(g, time.monotonic()):   # g may be None if OPEN
-        ...                                        # show / log / mark it
+    ev = det.feed(t, g)                      # t: seconds (any origin), g: uS or None
+    det.state                                # "IDLE" | "ARM" | "READ"   (after each feed)
+    if ev:                                   # an Event, or None
+        ev.as_dict()                         # JSON-ready
+    ...
+    ev = det.flush()                         # end of data: closes an open READ
 
-Offline replay of a recorded session, to tune against your annotations:
-    python3 elron.py session.srt [--sign -1] [--scale 1]
+Plugging into stream.py (publish() already gets every sample):
+    frame["s"] = det.state                   # state rides along on each frame
+    ev = det.feed(frame["t"], frame["g"])
+    if ev: announce_event(ev.as_dict())      # e.g. an SSE "ev" event; NOT written to recordings
+
+Notes:
+  * g=None (no contact) or a gap in t longer than Params.gap_s sends it to IDLE and
+    throws away any open READ (counted in det.aborted).
+  * Events appear when a READ CLOSES, i.e. after the fact. det.state == "READ" is
+    how you know one is open right now.
+  * Timings were tuned at ~20-50 Hz. The smoothing and rate windows are in seconds
+    and work at any rate, but a 0.5 s rate window is only a few samples at 10 Hz.
+  * Not thread-safe: call feed() from one thread (the reader).
 """
+import bisect
 import math
-import re
-import statistics
-import sys
 from collections import deque
+from dataclasses import dataclass, fields
 
-IDLE, ARMED, SQUEEZE, FALLING = "IDLE", "ARMED", "SQUEEZE", "FALLING"
+IDLE, ARM, READ = "IDLE", "ARM", "READ"
 
 
-class Elron:
-    # --- shared -------------------------------------------------------------
-    CALIBRATION_FRAMES = 100        # ~5 s at 20 Hz before either machine arms
-    BASELINE_TAU_S = 20.0           # slow tonic tracker: "where is home"
-    HISTORY_S = 12.0                # raw history kept for the fall machine
+# --- tunables ----------------------------------------------------------------
+@dataclass
+class Params:
+    smooth_tau_s: float = 0.15      # tiny input filter
+    settle_s: float = 3.0           # signal must be flat this long before arming
+    flat_pct: float = 2.0           # "flat" = within this many % over settle_s
+    start_pct: float = 6.0          # drawdown/drawup that opens a READ
+    min_amp_pct: float = 8.0        # smaller events are discarded
+    min_rate_pct_s: float = 1.0     # must be moving at least this fast (drift is ~0.25)
+    onset_window_s: float = 12.0    # how far back to look for where a change began
+    reversal_frac: float = 0.5      # READ closes when this share of it is given back
+    stall_s: float = 3.0            # a READ closes when it makes no real progress for this long
+    read_timeout_s: float = 30.0    # a READ can't stay open longer than this
+    slow_tau_s: float = 60.0        # slow baseline, logged/displayed as context only
+    rate_win_s: float = 0.5         # window for the peak-speed measurement
+    gap_s: float = 1.0              # a hole in the data longer than this = lost contact
+    rebound_gap_s: float = 1.0      # "starts at the previous peak" tolerance
 
-    # --- squeeze machine ----------------------------------------------------
-    NOISE_TAU_S = 5.0
-    NOISE_FLOOR = 1e-4              # uS
-    ARM_THRESH_K = 4.0              # frame step must beat K x typical jitter
-    DEBOUNCE_FRAMES = 3             # filters single-frame crackle pops
-    SETTLE_THRESH_K = 2.0
-    SETTLE_FRAMES = 6
-    SQUEEZE_TIMEOUT_S = 20.0
-    SUSTAIN_TOL_FRAC = 0.30
-    SUSTAIN_TOL_K = 3.0
 
-    # --- fall machine -------------------------------------------------------
-    CUR_WINDOW_S = 0.5              # "now" = median of the last 0.5 s
-    REF_FAR_S, REF_NEAR_S = 4.0, 2.0  # "before" = median from 4 s to 2 s ago
-    FALL_K = 4.0                    # drop must beat K x typical window drift
-    FALL_HOLD_FRAMES = 6            # ...and hold for 0.3 s
-    FALL_NOISE_TAU_S = 30.0         # noise estimate rises slowly...
-    FALL_NOISE_DOWN_S = 5.0         # ...but falls fast, so it tracks the quiet level
-    FALL_NOISE_FLOOR = 2e-3         # uS
-    FALL_QUIET_FRAC = 0.25          # "quiet" = drop below this x threshold
-    FALL_MIN_AMP = 0.3              # uS; smaller than this is never a fall
-    FALL_SETTLE_S = 3.0             # no new low for this long = fall is over
-    FALL_NEWLOW_K = 1.0             # a "new low" must beat the old by K x noise
-    FALL_TIMEOUT_S = 90.0
+HIST_S = 60.0
 
-    # --- arbitration --------------------------------------------------------
-    VETO_BEFORE_S, VETO_AFTER_S = 1.0, 3.0
 
-    def __init__(self, scale=1.0, sign=+1, **tuning):
-        self.sign = +1 if sign >= 0 else -1
-        self.noise_floor = self.NOISE_FLOOR * scale
-        self.fall_floor = self.FALL_NOISE_FLOOR * scale
-        self.fall_min_amp = self.FALL_MIN_AMP * scale
-        for k, v in tuning.items():
-            if not hasattr(self, k):
-                raise TypeError(f"unknown tuning parameter {k!r}")
-            setattr(self, k, v)
-        self.reset()
+# --- the detector (pure logic: no curses, no I/O) -----------------------------
+@dataclass
+class Event:
+    direction: int
+    t_start: float
+    t_peak: float
+    t_end: float
+    pre_g: float
+    peak_g: float
+    amp_pct: float
+    rate_pct_s: float
+    rebound: bool = False
 
-    # -- public -----------------------------------------------------------------
     @property
-    def state(self):
-        return f"squeeze:{self.sq_state} fall:{self.fl_state}"
+    def duration(self):
+        return self.t_peak - self.t_start
+
+    def cue(self):
+        return (f"EVENT {self.amp_pct:+.1f}% {self.duration:.1f}s "
+                f"{self.rate_pct_s:.1f}%/s" + (" rebound" if self.rebound else ""))
+
+    def as_dict(self):
+        """JSON-ready: times in the same seconds you fed in, values in your units."""
+        return {
+            "direction": self.direction,          # +1 conductance up, -1 down
+            "t_start": round(self.t_start, 3),
+            "t_peak": round(self.t_peak, 3),
+            "t_end": round(self.t_end, 3),
+            "duration": round(self.duration, 3),  # start -> peak
+            "pre_g": round(self.pre_g, 4),
+            "peak_g": round(self.peak_g, 4),
+            "amp_pct": round(self.amp_pct, 2),
+            "rate_pct_s": round(self.rate_pct_s, 2),
+            "rebound": self.rebound,
+        }
+
+
+def _x_at(pts, tq):
+    """Smoothed log-conductance at (or just before) time tq."""
+    i = bisect.bisect_right(pts, (tq, float("inf"))) - 1
+    return pts[max(i, 0)][1]
+
+
+class Detector:
+    def __init__(self, params=None):
+        self.p = params or Params()
+        self.slow = None
+        self.aborted = 0            # READs thrown away because contact was lost
+        self._to_idle()
+
+    def _to_idle(self):
+        if getattr(self, "ev", None) is not None:
+            self.aborted += 1
+        self.state = IDLE
+        self.hist = deque()
+        self.xs = None
+        self.last_t = None
+        self.ev = None
+        self.floor_t = None
+        self.prev = None            # (direction, t_peak) of the last closed event
+
+    # -- public ---------------------------------------------------------------
+    def feed(self, t, g):
+        """One sample (seconds, µS). g=None means no contact. -> finished Event or None."""
+        p = self.p
+        if g is None or g <= 0:
+            self._to_idle()
+            return None
+        if self.last_t is not None and t - self.last_t > p.gap_s:
+            self._to_idle()
+        dt = 0.0 if self.last_t is None else max(t - self.last_t, 1e-6)
+
+        x = math.log(g)
+        if self.xs is None:
+            self.xs = x
+            if self.slow is None:
+                self.slow = x
+        else:
+            self.xs += (x - self.xs) * (1 - math.exp(-dt / p.smooth_tau_s))
+            self.slow += (self.xs - self.slow) * (1 - math.exp(-dt / p.slow_tau_s))
+        self.last_t = t
+        self.hist.append((t, self.xs))
+        while self.hist and t - self.hist[0][0] > HIST_S:
+            self.hist.popleft()
+
+        if self.state == IDLE:
+            if self._flat(t):
+                self.state = ARM
+                self.floor_t = t - self.p.settle_s      # never backdate into the settling period
+            return None
+
+        pts = list(self.hist)
+        if self.state == ARM:
+            self._maybe_open(t, pts)
+            return None
+        return self._update_read(t, pts)
+
+    @property
+    def slow_g(self):
+        """Slow baseline in uS (context only), or None before the first sample."""
+        return None if self.slow is None else math.exp(self.slow)
 
     def reset(self):
-        """Forget everything (also what a fresh connect should do)."""
-        self.baseline = None            # in the user's units
-        self._xb = None                 # baseline in working units
-        self._t = self._x = None
-        self._hist = deque()
-        self._squeezes = []             # recent emitted squeezes (t0, t1)
-        self._sq_reset()
-        self._fl_reset()
+        """Forget everything: state, history, slow baseline, abort count."""
+        self.slow = None
+        self.aborted = 0
+        self.ev = None                              # a reset is not an aborted READ
+        self._to_idle()
 
-    def update(self, value, t):
-        """Feed one reading (value in your units, t in seconds).
-        value=None means out of range / no contact. Returns a list of event
-        dicts that completed on this reading (usually empty)."""
-        if value is None:
-            self._abort()
-            return []
-        x = -self.sign * value
-        if self._t is not None and t - self._t > 1.0:
-            self._abort()               # a hole in the data: start fresh
-        dt = 0.05 if self._t is None else min(max(t - self._t, 0.001), 1.0)
-        delta = 0.0 if self._x is None else x - self._x
-        self._t, self._x = t, x
-        if self._xb is None:
-            self._xb = x
+    # -- internals ------------------------------------------------------------
+    def _flat(self, t):
+        p = self.p
+        if t - self.hist[0][0] < p.settle_s:
+            return False
+        xs = [x for tt, x in self.hist if tt >= t - p.settle_s]
+        return max(xs) - min(xs) <= math.log1p(p.flat_pct / 100)
 
-        self._hist.append((t, x))
-        while self._hist and t - self._hist[0][0] > self.HISTORY_S:
-            self._hist.popleft()
+    def _maybe_open(self, t, pts):
+        p = self.p
+        lo_t = max(t - p.onset_window_s, self.floor_t)
+        win = [a for a in pts if a[0] >= lo_t]
+        if len(win) < 2:
+            return False
+        hi = max(reversed(win), key=lambda a: a[1])     # latest max / min
+        lo = min(reversed(win), key=lambda a: a[1])
+        x = self.xs
+        start = math.log1p(p.start_pct / 100)
+        speed = (x - _x_at(pts, t - 1.0)) / 1.0
+        floor_rate = math.log1p(p.min_rate_pct_s / 100)
+        cands = []
+        if x - hi[1] <= -start and speed <= -floor_rate:
+            cands.append((-1, hi, hi[1] - x))
+        if x - lo[1] >= start and speed >= floor_rate:
+            cands.append((+1, lo, x - lo[1]))
+        if not cands:
+            return False
+        d, (ot, ox), _ = max(cands, key=lambda c: c[2])
 
-        sq = self._squeeze_tick(x, delta, dt, t)
-        fl = self._fall_tick(dt, t)
-        self.baseline = self._u(self._xb)
+        since = [a for a in pts if a[0] >= ot]
+        pk_t, pk_x = (min if d < 0 else max)(reversed(since), key=lambda a: a[1])
+        maxr = 0.0
+        for tt, xx in since:
+            maxr = max(maxr, d * (xx - _x_at(pts, tt - p.rate_win_s)) / p.rate_win_s)
+        rebound = bool(self.prev and d == -self.prev[0]
+                       and abs(ot - self.prev[1]) <= p.rebound_gap_s)
+        self.ev = dict(d=d, t0=ot, pre=ox, pk_t=pk_t, pk_x=pk_x, maxr=maxr, rebound=rebound)
+        self.state = READ
+        return True
 
-        events = []
-        if sq and sq["kind"] == "squeeze":      # level shifts are swallowed
-            self._squeezes.append((sq["t"], sq["t_end"]))
-            events.append(sq)
-        self._squeezes = [s for s in self._squeezes if t - s[1] < 120]
-        if fl and not self._vetoed(fl):
-            events.append(fl)
-        return events
-
-    # -- helpers ----------------------------------------------------------------
-    def _u(self, x):
-        """Working units back to the user's units."""
-        return -self.sign * x
-
-    def _median(self, t0, t1):
-        vals = [x for (tt, x) in self._hist if t0 <= tt <= t1]
-        return statistics.median(vals) if len(vals) >= 3 else None
-
-    def _vetoed(self, fl):
-        return any(fl["t"] <= s1 + self.VETO_AFTER_S and
-                   fl["t_low"] + 1.0 >= s0 - self.VETO_BEFORE_S
-                   for s0, s1 in self._squeezes)
-
-    def _abort(self):
-        """Lost contact / data hole: drop any event in progress, keep going."""
-        self._t = self._x = None
-        self._hist.clear()
-        if self.sq_state in (SQUEEZE,):
-            self.sq_state = ARMED
-        self.sq_deb = self.sq_settle = 0
-        if self.fl_state == FALLING:
-            self.fl_state = ARMED
-        self.fl_hold = 0
-        self.fl_cool = None
-
-    def _baseline_free(self):
-        return self.sq_state != SQUEEZE and self.fl_state != FALLING
-
-    # -- squeeze machine: IDLE -> ARMED -> SQUEEZE -> ARMED ---------------------------
-    def _sq_reset(self):
-        self.sq_state = IDLE
-        self.sq_noise = None
-        self.sq_cal = 0
-        self.sq_deb = 0
-        self.sq_deb_t0 = None
-        self.sq_settle = 0
-        self.sq_prev_sign = 0
-        self.sq_run = 0
-        self.sq_pre = self.sq_t0 = self.sq_peak = self.sq_peak_t = None
-
-    def _squeeze_tick(self, x, delta, dt, t):
-        a_noise = min(dt / self.NOISE_TAU_S, 1)
-        a_base = min(dt / self.BASELINE_TAU_S, 1)
-
-        if self.sq_state == IDLE:
-            if self.sq_noise is None:
-                self.sq_noise = max(abs(delta), self.noise_floor)
-            else:
-                if self._baseline_free():
-                    self._xb += (x - self._xb) * a_base
-                self.sq_noise += (abs(delta) - self.sq_noise) * a_noise
-                self.sq_noise = max(self.sq_noise, self.noise_floor)
-            self.sq_cal += 1
-            if self.sq_cal >= self.CALIBRATION_FRAMES:
-                self.sq_state = ARMED
-            return None
-
-        if self.sq_state == ARMED:
-            thresh = self.ARM_THRESH_K * self.sq_noise
-            if delta < -thresh:
-                if self.sq_deb == 0:
-                    self.sq_deb_t0 = t
-                self.sq_deb += 1
-            else:
-                self.sq_deb = 0
-                if self._baseline_free():
-                    self._xb += (x - self._xb) * a_base
-                # feed the noise estimate only back-and-forth jitter, not a
-                # sustained run one way, and cap each step so one crackle pop
-                # can't inflate the threshold meant to ignore it
-                s = (delta > 0) - (delta < 0)
-                if s != 0 and s == self.sq_prev_sign:
-                    self.sq_run += 1
-                else:
-                    self.sq_run, self.sq_prev_sign = 1, s
-                if self.sq_run <= 2:
-                    step = min(abs(delta), 3 * self.sq_noise)
-                    self.sq_noise += (step - self.sq_noise) * a_noise
-                    self.sq_noise = max(self.sq_noise, self.noise_floor)
-            if self.sq_deb >= self.DEBOUNCE_FRAMES:
-                self.sq_pre = self._xb
-                self.sq_t0 = self.sq_deb_t0
-                self.sq_peak, self.sq_peak_t = x, t
-                self.sq_settle = self.sq_deb = 0
-                self.sq_state = SQUEEZE
-            return None
-
-        # SQUEEZE
-        if x < self.sq_peak:
-            self.sq_peak, self.sq_peak_t = x, t
-        settle = self.SETTLE_THRESH_K * self.sq_noise
-        self.sq_settle = self.sq_settle + 1 if abs(delta) < settle else 0
-        if self.sq_settle >= self.SETTLE_FRAMES or t - self.sq_t0 >= self.SQUEEZE_TIMEOUT_S:
-            return self._squeeze_resolve(x, t)
+    def _update_read(self, t, pts):
+        p, e = self.p, self.ev
+        d = e["d"]
+        if d * (self.xs - e["pk_x"]) > 0:
+            e["pk_x"], e["pk_t"] = self.xs, t
+        r = d * (self.xs - _x_at(pts, t - p.rate_win_s)) / p.rate_win_s
+        e["maxr"] = max(e["maxr"], r)
+        excursion = d * (e["pk_x"] - e["pre"])
+        reversal = -d * (self.xs - e["pk_x"])
+        if reversal >= p.reversal_frac * excursion:
+            return self._close(t, pts, reversed_=True)
+        if t - e["t0"] >= p.stall_s:
+            floor_rate = math.log1p(p.min_rate_pct_s / 100)
+            progress = d * (self.xs - _x_at(pts, t - p.stall_s))
+            if progress < 0.5 * floor_rate * p.stall_s:
+                return self._close(t, pts, reversed_=False)
+        if t - e["t0"] >= p.read_timeout_s:
+            return self._close(t, pts, reversed_=False)
         return None
 
-    def _squeeze_resolve(self, x, t):
-        amp = self.sq_pre - self.sq_peak
-        tol = max(self.SUSTAIN_TOL_K * self.sq_noise,
-                  self.SUSTAIN_TOL_FRAC * abs(amp))
-        offset = abs(x - self.sq_pre)
-        returned = offset <= tol
-        margin = (tol - offset) / tol if tol > 0 else 0.0
-        conf = min(max(0.5 + 0.5 * (margin if returned else -margin), 0.5), 0.99)
-        ev = {
-            "kind": "squeeze" if returned else "shift",
-            "t": self.sq_t0, "t_end": t,
-            "amplitude": amp,
-            "attack_s": self.sq_peak_t - self.sq_t0,
-            "release_s": t - self.sq_peak_t,
-            "baseline": self._u(self.sq_pre),
-            "sustain": self._u(x),
-            "confidence": conf,
-        }
-        self._xb = x                    # re-center, wherever it landed
-        self.sq_state = ARMED
-        self.sq_pre = None
-        return ev
-
-    # -- fall machine: IDLE -> ARMED -> FALLING -> (cooldown) -> ARMED -----------------
-    def _fl_reset(self):
-        self.fl_state = IDLE
-        self.fl_noise = None
-        self.fl_cal = 0
-        self.fl_hold = 0
-        self.fl_cool = None             # no re-arming until this time
-        self.fl_pre = self.fl_t0 = None
-        self.fl_low = self.fl_low_t = self.fl_mark = self.fl_mark_t = None
-        self.fl_thr = None
-
-    def _fall_tick(self, dt, t):
-        cur = self._median(t - self.CUR_WINDOW_S, t)
-        ref = self._median(t - self.REF_FAR_S, t - self.REF_NEAR_S)
-        if cur is None or ref is None:
-            return None                 # not enough history yet
-        drop = ref - cur                # positive = the signal fell
-        if self.fl_state == IDLE:
-            if self.fl_noise is None:
-                self.fl_noise = max(abs(drop), self.fall_floor)
-            else:
-                self._fall_noise(abs(drop), dt)
-            self.fl_cal += 1
-            if self.fl_cal >= self.CALIBRATION_FRAMES:
-                self.fl_state = ARMED
+    def flush(self):
+        """End of data: close any open READ. -> Event or None."""
+        if self.state != READ or self.last_t is None:
             return None
+        return self._close(self.last_t, list(self.hist), reversed_=False)
 
-        if self.fl_state == ARMED:
-            thr = self.FALL_K * self.fl_noise
-            cooling = self.fl_cool is not None and t < self.fl_cool
-            # winsorised: a fall in progress can't inflate its own threshold
-            self._fall_noise(min(abs(drop), thr), dt)
-            self.fl_hold = self.fl_hold + 1 if (drop > thr and not cooling) else 0
-            if self.fl_hold >= self.FALL_HOLD_FRAMES:
-                onset = self._find_onset(ref, thr, t)
-                pre = self._median(onset - 2.0, onset)
-                self.fl_pre = pre if pre is not None else ref
-                self.fl_t0 = onset
-                self.fl_low = self.fl_mark = cur
-                self.fl_low_t = self.fl_mark_t = t
-                self.fl_thr = thr
-                self.fl_hold = 0
-                self.fl_state = FALLING
-            return None
-
-        # FALLING: follow the signal down until it stops finding new lows
-        if cur < self.fl_low:
-            self.fl_low, self.fl_low_t = cur, t
-        if cur < self.fl_mark - self.FALL_NEWLOW_K * self.fl_noise:
-            self.fl_mark, self.fl_mark_t = cur, t
-        if (t - self.fl_mark_t >= self.FALL_SETTLE_S
-                or t - self.fl_t0 >= self.FALL_TIMEOUT_S):
-            return self._fall_resolve(cur, t)
-        return None
-
-    def _find_onset(self, ref, thr, t):
-        """When did the descent start? Walk back from now to the last moment
-        the signal (5-sample median, so crackles don't fool it) was still
-        within a quarter-threshold of its earlier level. Slow drift can fool
-        a 'last quiet moment' test; this can't."""
-        h = [x for (_, x) in self._hist]
-        ts = [tt for (tt, _) in self._hist]
-        for i in range(len(h) - 3, 1, -1):
-            if statistics.median(h[i - 2:i + 3]) >= ref - self.FALL_QUIET_FRAC * thr:
-                return ts[i]
-        return ts[0]
-
-    def _fall_noise(self, size, dt):
-        """Asymmetric EMA of the window drift: slow up, fast down. The start-up
-        settle and any big fall can't leave the threshold inflated for long."""
-        tau = self.FALL_NOISE_TAU_S if size > self.fl_noise else self.FALL_NOISE_DOWN_S
-        self.fl_noise += (size - self.fl_noise) * min(dt / tau, 1)
-        self.fl_noise = max(self.fl_noise, self.fall_floor)
-
-    def _fall_resolve(self, cur, t):
-        amp = self.fl_pre - self.fl_low
-        ev = None
-        if amp >= self.fall_min_amp:
-            ev = {
-                "kind": "fall",
-                "t": self.fl_t0, "t_end": t, "t_low": self.fl_low_t,
-                "amplitude": amp,
-                "attack_s": self.fl_low_t - self.fl_t0,
-                "duration_s": t - self.fl_t0,
-                "recovery": min(max((cur - self.fl_low) / amp, 0.0), 1.0),
-                "strength": amp / max(self.fl_noise, 1e-12),
-                "baseline": self._u(self.fl_pre),
-                "low": self._u(self.fl_low),
-                "sustain": self._u(cur),
-            }
-        self.fl_state = ARMED
-        self.fl_hold = 0
-        # after a real fall the "before" window still holds it for a few
-        # seconds, so don't re-trigger on its own tail. A candidate too small
-        # to report gets only a brief pause, so it can't mask a real fall
-        # that starts right behind it.
-        self.fl_cool = t + (self.REF_FAR_S + 0.5 if ev else 1.0)
-        return ev
-
-
-# --- offline replay -----------------------------------------------------------
-def _tc(s):
-    h, m, rest = s.strip().split(":")
-    sec, ms = rest.split(",")
-    return ((int(h) * 60 + int(m)) * 60 + int(sec)) + int(ms) / 1000
-
-
-def load_srt(path):
-    """-> (frames [(t_s, value|None)], notes [(t0, t1, text, read)])"""
-    frames, notes = [], []
-    for block in open(path, encoding="utf-8").read().strip().split("\n\n"):
-        lines = block.strip().split("\n")
-        if len(lines) < 3 or "-->" not in lines[1]:
-            continue
-        a, b = (_tc(x) for x in lines[1].split("-->"))
-        body = "\n".join(lines[2:]).strip()
-        m = re.match(r"^\[(.*)\](\s*READ)?$", body, re.S)
-        if m:
-            notes.append((a, b, m.group(1), bool(m.group(2))))
-        elif body == "OPEN":
-            frames.append((a, None))
+    def _close(self, t, pts, reversed_):
+        p, e = self.p, self.ev
+        d = e["d"]
+        pre_g, peak_g = math.exp(e["pre"]), math.exp(e["pk_x"])
+        t10 = e["t0"]                                   # where it first leaves 10% of the way
+        for tt, xx in pts:
+            if tt >= e["t0"] and d * (xx - e["pre"]) >= 0.1 * d * (e["pk_x"] - e["pre"]):
+                t10 = tt
+                break
+        ev = Event(direction=d, t_start=min(t10, e["pk_t"]), t_peak=e["pk_t"], t_end=t,
+                   pre_g=pre_g, peak_g=peak_g,
+                   amp_pct=(peak_g / pre_g - 1) * 100,
+                   rate_pct_s=abs(math.exp(d * e["maxr"]) - 1) * 100,
+                   rebound=e["rebound"])
+        self.ev = None
+        self.state = ARM
+        if reversed_:
+            self.floor_t, self.prev = e["pk_t"], (d, e["pk_t"])
+            self._maybe_open(t, pts)        # the opposite excursion may start right here
         else:
-            try:
-                frames.append((a, float(body)))
-            except ValueError:
-                pass
-    return frames, notes
+            self.floor_t, self.prev = t, None
+        return ev if abs(ev.amp_pct) >= p.min_amp_pct else None
 
 
-def replay(path, sign, scale):
-    frames, notes = load_srt(path)
-    el = Elron(scale=scale, sign=sign)
-    events = []
-    for t, v in frames:
-        events += el.update(v, t)
-    mmss = lambda s: f"{int(s // 60):02d}:{s % 60:04.1f}"
-    print(f"{len(frames)} frames, {len(events)} events, sign={sign:+d}, scale={scale:g}")
-    for ev in events:
-        extra = (f"recovery {ev['recovery']:.0%}  strength {ev['strength']:.1f}"
-                 if ev["kind"] == "fall" else f"conf {ev['confidence']:.2f}")
-        print(f"  {mmss(ev['t'])}  {ev['kind']:8s} amp {ev['amplitude']:.3f}  "
-              f"attack {ev['attack_s']:.1f}s  {extra}")
-    if notes:
-        hit = 0
-        for a, b, text, _ in notes:
-            got = [e for e in events if a - 3 <= e["t"] <= b]
-            hit += bool(got)
-            print(f"  note {mmss(a)}-{mmss(b)}: " +
-                  (", ".join(e["kind"] for e in got) or "MISSED"))
-        stray = [e for e in events if not any(a - 3 <= e["t"] <= b for a, b, *_ in notes)]
-        print(f"  {hit}/{len(notes)} notes hit, {len(stray)} events outside any note")
-
-
-if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser(description="replay an .srt session through Elron")
-    ap.add_argument("srt")
-    ap.add_argument("--sign", type=int, default=+1,
-                    help="+1: events are rises (pimeter conductance), -1: drops (old Arduino files)")
-    ap.add_argument("--scale", type=float, default=1.0, help="units per uS (1000 for nS)")
-    args = ap.parse_args()
-    replay(args.srt, args.sign, args.scale)
+def params_from_sets(sets):
+    """["start_pct=8", "min_rate_pct_s=2"] -> Params. Raises ValueError on a bad name."""
+    p, names = Params(), {f.name for f in fields(Params)}
+    for item in sets or []:
+        k, _, v = item.partition("=")
+        k = k.strip().lower()
+        if k not in names:
+            raise ValueError(f"unknown parameter {k!r}; choices: {', '.join(sorted(names))}")
+        setattr(p, k, float(v))
+    return p
