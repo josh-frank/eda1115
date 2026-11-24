@@ -13,8 +13,11 @@ GET  /stream        Server-Sent Events. Default events are samples:
                     It is sent on connect and whenever recording starts or stops.
                     A third, "state", reports the detector's state whenever it changes
                     (and once on connect):  {"state": "IDLE"|"ARM"|"READ", "t": secs}
-                    Events and the sample frames are unchanged; clients that don't
-                    listen for "state" never notice it.
+                    A fourth, "ev", carries each finished detector Event (see
+                    elron2.Event.as_dict) when its READ closes. The last 60 s of them are
+                    replayed on connect. Events are never written to recordings.
+                    The sample frames are unchanged; clients that don't listen for
+                    "state" or "ev" never notice them.
 POST /record/start  start recording to <outdir>/<timestamp>.srt   (idempotent)
 POST /record/stop   stop and write the .srt                       (idempotent)
 
@@ -33,7 +36,11 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from smbus2 import SMBus
-from elron import Detector
+
+try:
+    from elron2 import Detector
+except ImportError:                    # if you renamed elron2.py to elron.py
+    from elron import Detector
 
 ADDR = 0x48                # ADS1115 default (ADDR pin to GND)
 REG_CONV, REG_CONFIG = 0x00, 0x01
@@ -170,6 +177,7 @@ rec = Recorder(args.outdir)
 
 det = Detector()                                       # fed from publish(), i.e. the reader thread only
 cur = {"state": None, "t": 0.0}                        # last state we announced
+events = deque(maxlen=50)                              # (t_end, encoded "ev" msg) for late joiners
 
 # ---- fan-out to clients -------------------------------------------------------
 HISTORY_S = 60
@@ -191,20 +199,24 @@ def send_all(msg):
                 pass
 
 
+def named_msg(name, payload):
+    return f"event: {name}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
+
+
 def rec_msg(state):
-    return f"event: rec\ndata: {json.dumps(state, separators=(',', ':'))}\n\n".encode()
+    return named_msg("rec", state)
 
 
 def state_msg(state, t):
-    body = json.dumps({"state": state, "t": round(t, 3)}, separators=(",", ":"))
-    return f"event: state\ndata: {body}\n\n".encode()
+    return named_msg("state", {"state": state, "t": round(t, 3)})
 
 
 def publish(frame):
     rec.add(frame["t"], frame["g"])
     msg = f"data: {json.dumps(frame, separators=(',', ':'))}\n\n".encode()
+    ev = None
     try:
-        det.feed(frame["t"], frame["g"])               # finished Events are ignored here
+        ev = det.feed(frame["t"], frame["g"])          # a finished Event, or None
     except Exception as e:                             # a detector bug must never stop the data
         print(f"detector error: {e!r}; resetting it")
         det.reset()
@@ -214,6 +226,10 @@ def publish(frame):
         if det.state != cur["state"]:                  # a transition: tell everyone, once
             cur["state"], cur["t"] = det.state, frame["t"]
             send_all(state_msg(cur["state"], cur["t"]))
+        if ev:                                         # a READ just closed
+            m = named_msg("ev", ev.as_dict())
+            events.append((ev.t_end, m))
+            send_all(m)
 
 
 def announce(state):
@@ -295,6 +311,7 @@ class Handler(BaseHTTPRequestHandler):
             backfill = list(history)
             clients.add(q)
             st = dict(cur)
+            recent = list(events)
         try:
             self.send_response(200)
             self.cors()
@@ -306,6 +323,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(rec_msg(rec.state()))
             if st["state"]:
                 self.wfile.write(state_msg(st["state"], st["t"]))
+            for t_end, m in recent:                    # recent events, so late joiners see the marks
+                if t_end > now() - HISTORY_S:
+                    self.wfile.write(m)
             self.wfile.flush()
             while True:
                 try:

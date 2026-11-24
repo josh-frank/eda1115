@@ -189,3 +189,56 @@ select:focus {
   height: 80px;
   margin: 12px auto;
 }
+
+/* ── event toast ── */
+#toast {
+  position: fixed;
+  bottom: 32px;
+  left: 50%;
+  transform: translateX(-50%) translateY(80px);
+  background: #1a1a1a;
+  border: 1px solid #333;
+  border-radius: 6px;
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  pointer-events: none;
+  z-index: 100;
+}
+
+#toast.visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+  pointer-events: auto;
+}
+
+#toast-label {
+  color: #ddd;
+}
+
+#toast-meta {
+  color: #888;
+  font-size: 0.85em;
+}
+
+#toast.rebound #toast-label {
+  color: #888;
+}
+
+#toast-dismiss {
+  color: #444;
+  background: none;
+  border: none;
+  font-family: monospace;
+  font-size: 1em;
+  cursor: pointer;
+  padding: 0 0 0 4px;
+}
+
+#toast-dismiss:hover {
+  color: #888;
+}

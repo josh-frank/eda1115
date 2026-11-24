@@ -73,6 +73,12 @@
 
   </main>
 
+  <div id="toast">
+    <span id="toast-label"></span>
+    <span id="toast-meta"></span>
+    <button id="toast-dismiss" title="dismiss">×</button>
+  </div>
+
   <script>
     const $ = id => document.getElementById(id);
     const needle = $("needle");
@@ -276,6 +282,7 @@
     const GAP_MS = 1000;         // break the line across gaps (no-contact frames)
 
     let polyData = [];           // { t (stream ms), g }
+    let marks = [];              // { t (stream ms, event start), rebound } dotted lines
 
     function updatePolygram(g, tMs) {
       polyData.push({ t: tMs, g });
@@ -283,6 +290,7 @@
       let n = 0;
       while (n < polyData.length && polyData[n].t < cutoff) n++;
       if (n > 0) polyData.splice(0, n);
+      if (marks.length) marks = marks.filter(m => m.t >= cutoff);
     }
 
     function renderPolygram() {
@@ -301,6 +309,23 @@
       const now = polyData[polyData.length - 1].t;
       const toY = v => H * (1 - (v - lo) / range);
       const toX = t => W * (1 - (now - t) / WINDOW_MS);
+
+      // event marks: dotted vertical line where each detected excursion began
+      if (marks.length) {
+        ctx.save();
+        ctx.setLineDash([2, 3]);
+        ctx.lineWidth = 1;
+        for (const m of marks) {
+          const x = Math.round(toX(m.t)) + 0.5;
+          if (x < 0 || x > W) continue;
+          ctx.strokeStyle = m.rebound ? "#555" : "#aaa";
+          ctx.beginPath();
+          ctx.moveTo(x, 0);
+          ctx.lineTo(x, H);
+          ctx.stroke();
+        }
+        ctx.restore();
+      }
 
       ctx.beginPath();
       ctx.strokeStyle = "red";
@@ -367,9 +392,38 @@
     }
     $("rec").onclick = toggleRec;
 
+    // ── events: toast + polygram mark ──
+    // Detector events arrive as "ev" SSE events when a READ closes. On connect the
+    // server replays recent ones; those get a mark but no toast (they're old news).
+    const TOAST_MS = 5000;
+    let toastTimer = null;
+    const toR = p => p <= -100 ? Infinity : (1 / (1 + p / 100) - 1) * 100;   // % in G -> % in R
+    const rateStr = r => !isFinite(r) ? "∞" : Math.abs(r) < 10 ? Math.abs(r).toFixed(1) : String(Math.round(Math.abs(r)));
+
+    function showToast(ev) {
+      const inR = units === "r";                         // follow the Units menu
+      const amp = inR ? toR(ev.amp_pct) : ev.amp_pct;
+      const rate = inR ? toR(ev.direction * ev.rate_pct_s) : ev.direction * ev.rate_pct_s;
+      $("toast-label").textContent = `${amp > 0 ? "▲" : "▼"} ${pctStr(amp)}`;
+      $("toast-meta").textContent =
+        `${ev.duration.toFixed(1)} s · ${rateStr(rate)} %/s` + (ev.rebound ? " · rebound" : "");
+      $("toast").classList.toggle("rebound", ev.rebound);
+      $("toast").classList.toggle("visible", true);
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(hideToast, TOAST_MS);
+    }
+    function hideToast() { $("toast").classList.toggle("visible", false); }
+    $("toast-dismiss").onclick = () => { clearTimeout(toastTimer); hideToast(); };
+
+    function onEvent(ev) {
+      marks.push({ t: ev.t_start * 1000, rebound: ev.rebound });
+      if (streamT - ev.t_end < 2) showToast(ev);         // live, not a replay
+    }
+
     // ── stream ──
     // stream.py: GET /stream -> SSE frames {"t": secs, "v": volts, "g": uS | null},
-    // plus "rec" events {"on": bool, ...} when recording starts or stops.
+    // "rec" events {"on": bool, ...} when recording starts or stops, and "ev" events
+    // (one per finished detector Event). The "state" event is not used by the page yet.
     let es = null;
     let lastRx = 0;
 
@@ -384,6 +438,7 @@
       lastFrameT = null;
       lastG = null;
       polyData = [];
+      marks = [];
       ledBr.fill(0);
       ledHead = null;
       ledPegged = false;
@@ -424,6 +479,7 @@
       };
 
       es.addEventListener("rec", e => applyRec(JSON.parse(e.data)));
+      es.addEventListener("ev", e => onEvent(JSON.parse(e.data)));
 
       es.onerror = () => setStatus("stream lost, retrying", "bad");
     }
