@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>elron1115 profile tuner</title>
+<style>
+:root{--bg:#f6f5f0;--fg:#1d1d1b;--mut:#6a6962;--line:#d6d4c8;--card:#fff;--idle:#b4b2a9;--arm:#1D9E75;--read:#EF9F27;--ev:#C2411B;--raw:#9a988e;--sm:#185FA5}
+@media(prefers-color-scheme:dark){:root{--bg:#1b1b19;--fg:#ecebe4;--mut:#a3a199;--line:#3a3a36;--card:#242422;--idle:#5F5E5A;--arm:#5DCAA5;--read:#EF9F27;--ev:#F0997B;--raw:#6d6b64;--sm:#85B7EB}}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif;max-width:1000px;margin-inline:auto}
+h1{font-size:18px;font-weight:500;margin:0 0 2px}
+.sub{color:var(--mut);margin:0 0 12px}
+canvas{width:100%;height:300px;display:block;background:var(--card);border:1px solid var(--line);border-radius:8px}
+.legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--mut);font-size:12px;margin:6px 0 10px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+#evs{font:12px ui-monospace,monospace;color:var(--mut);min-height:2.6em;margin-bottom:12px;white-space:pre-wrap}
+.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+.bar label{display:flex;gap:6px;align-items:center;color:var(--mut)}
+button,input[type=text]{font:inherit;padding:6px 10px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg)}
+button{cursor:pointer}button.go{background:var(--sm);color:var(--bg);border-color:var(--sm)}
+button:focus-visible,input:focus-visible{outline:2px solid var(--sm);outline-offset:1px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}
+fieldset{border:1px solid var(--line);border-radius:8px;padding:8px 12px 10px;margin:0;background:var(--card)}
+legend{padding:0 6px;color:var(--mut)}
+.row{display:grid;grid-template-columns:1fr 74px;gap:2px 8px;padding:6px 0;border-top:1px solid var(--line)}
+.row:first-of-type{border-top:0}
+.row b{font:500 13px ui-monospace,monospace}
+.row small{grid-column:1/3;color:var(--mut);font-size:12px}
+.row input[type=range]{width:100%;grid-column:1}
+.row input[type=number]{width:74px;font:inherit;padding:3px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+.na{color:var(--mut);font-size:11px;font-weight:400}
+</style></head>
+<body>
+<h1>elron1115 profile tuner</h1>
+<p class="sub">A synthetic squeeze runs through a port of the detector. Move a slider and watch where READs open and close.</p>
+<canvas id="cv"></canvas>
+<div class="legend">
+<span><i style="background:var(--idle)"></i>IDLE</span><span><i style="background:var(--arm)"></i>ARM</span><span><i style="background:var(--read)"></i>READ</span>
+<span><i style="background:var(--raw)"></i>raw</span><span><i style="background:var(--sm)"></i>smoothed</span><span><i style="background:var(--ev)"></i>t_start / peak / t_end</span>
+</div>
+<div id="evs"></div>
+<div class="bar">
+<label>Fidget <input type="range" id="fid" min="0" max="1" step="0.05" value="0.3"><span id="fidv">0.30</span></label>
+<button id="seed">Reroll fidget</button>
+<label>Profile name <input type="text" id="name" value="cans" size="12"></label>
+<button class="go" id="save">Save .elron1115.toml</button>
+<button id="reset">Reset to defaults</button>
+</div>
+<div class="grid" id="grid"></div>
+
+<script>
+const GROUPS=[
+["setup-dependent: sample rate, noise floor, electrode contact",[
+["smooth_tau_s",0.15,0,1,0.01,"tiny input filter"],
+["flat_pct",2.0,0.2,10,0.1,"\"flat\" = within this many % over settle_s"],
+["min_rate_pct_s",1.0,0.1,10,0.1,"must be moving at least this fast (drift is ~0.25)"],
+["rate_win_s",0.5,0.1,2,0.05,"window for the peak-speed measurement"],
+["gap_s",1.0,0.2,5,0.1,"a hole in the data longer than this = lost contact","na"],
+["slow_tau_s",60.0,5,300,1,"slow baseline, logged/displayed as context only","na"]]],
+["dynamics: how the signal behaves",[
+["settle_s",3.0,0.5,10,0.1,"signal must be flat this long before arming"],
+["onset_window_s",12.0,1,30,0.5,"how far back to look for where a change began"],
+["reversal_frac",0.5,0.1,0.9,0.05,"READ closes when this share of it is given back"],
+["stall_s",3.0,1,10,0.5,"a READ closes when it makes no real progress for this long"],
+["read_timeout_s",30.0,5,60,1,"a READ can't stay open longer than this"]]],
+["events: what counts as one",[
+["start_pct",6.0,1,20,0.5,"drawdown/drawup that opens a READ"],
+["min_amp_pct",8.0,1,30,0.5,"smaller events are discarded"],
+["rebound_gap_s",1.0,0.2,5,0.1,"\"starts at the previous peak\" tolerance (flag only)"]]]];
+const DEF={},P={};GROUPS.forEach(g=>g[1].forEach(p=>{DEF[p[0]]=p[1];P[p[0]]=p[1]}));
+const HIST_S=60,IDLE=0,ARM=1,READ=2;
+
+function detect(P,ts,xsIn){
+let st,hist,xs,lastT,ev,floorT,prev;const out=[],states=[],smooth=[];
+const toIdle=()=>{st=IDLE;hist=[];xs=null;lastT=null;ev=null;floorT=null;prev=null};toIdle();
+const xAt=(pts,tq)=>{let lo=0,hi=pts.length;while(lo<hi){const m=(lo+hi)>>1;if(pts[m][0]<=tq)lo=m+1;else hi=m}return pts[Math.max(lo-1,0)][1]};
+const lg=v=>Math.log1p(v/100);
+const flat=t=>{if(t-hist[0][0]<P.settle_s)return false;let mx=-1e9,mn=1e9;for(const[a,b]of hist)if(a>=t-P.settle_s){if(b>mx)mx=b;if(b<mn)mn=b}return mx-mn<=lg(P.flat_pct)};
+function maybeOpen(t,pts){
+const lo_t=Math.max(t-P.onset_window_s,floorT),win=pts.filter(a=>a[0]>=lo_t);if(win.length<2)return false;
+let hi=win[0],lo=win[0];for(const a of win){if(a[1]>=hi[1])hi=a;if(a[1]<=lo[1])lo=a}
+const x=xs,start=lg(P.start_pct),speed=x-xAt(pts,t-1),fr=lg(P.min_rate_pct_s),c=[];
+if(x-hi[1]<=-start&&speed<=-fr)c.push([-1,hi,hi[1]-x]);
+if(x-lo[1]>=start&&speed>=fr)c.push([1,lo,x-lo[1]]);
+if(!c.length)return false;
+let b=c[0];for(const k of c)if(k[2]>b[2])b=k;const d=b[0],[ot,ox]=b[1];
+const since=pts.filter(a=>a[0]>=ot);let pk=since[0];
+for(const a of since)if(d<0?a[1]<=pk[1]:a[1]>=pk[1])pk=a;
+let maxr=0;for(const[tt,xx]of since)maxr=Math.max(maxr,d*(xx-xAt(pts,tt-P.rate_win_s))/P.rate_win_s);
+const rebound=!!(prev&&d===-prev[0]&&Math.abs(ot-prev[1])<=P.rebound_gap_s);
+ev={d,t0:ot,pre:ox,pk_t:pk[0],pk_x:pk[1],maxr,rebound};st=READ;return true}
+function close(t,pts,rev){
+const e=ev,d=e.d,pre_g=Math.exp(e.pre),peak_g=Math.exp(e.pk_x);let t10=e.t0;
+for(const[tt,xx]of pts)if(tt>=e.t0&&d*(xx-e.pre)>=0.1*d*(e.pk_x-e.pre)){t10=tt;break}
+const r={d,t_start:Math.min(t10,e.pk_t),t_peak:e.pk_t,t_end:t,amp:(peak_g/pre_g-1)*100,rate:Math.abs(Math.exp(d*e.maxr)-1)*100,rebound:e.rebound};
+ev=null;st=ARM;
+if(rev){floorT=e.pk_t;prev=[d,e.pk_t];maybeOpen(t,pts)}else{floorT=t;prev=null}
+return Math.abs(r.amp)>=P.min_amp_pct?r:null}
+function update(t,pts){
+const e=ev,d=e.d;if(d*(xs-e.pk_x)>0){e.pk_x=xs;e.pk_t=t}
+const r=d*(xs-xAt(pts,t-P.rate_win_s))/P.rate_win_s;e.maxr=Math.max(e.maxr,r);
+const exc=d*(e.pk_x-e.pre),rv=-d*(xs-e.pk_x);
+if(rv>=P.reversal_frac*exc)return close(t,pts,true);
+if(t-e.t0>=P.stall_s){const fr=lg(P.min_rate_pct_s);if(d*(xs-xAt(pts,t-P.stall_s))<0.5*fr*P.stall_s)return close(t,pts,false)}
+if(t-e.t0>=P.read_timeout_s)return close(t,pts,false);return null}
+ts.forEach((t,i)=>{
+const x=xsIn[i],dt=lastT===null?0:Math.max(t-lastT,1e-6);
+if(xs===null)xs=x;else xs+=(x-xs)*(1-Math.exp(-dt/P.smooth_tau_s));
+lastT=t;hist.push([t,xs]);while(hist.length&&t-hist[0][0]>HIST_S)hist.shift();
+let r=null;
+if(st===IDLE){if(flat(t)){st=ARM;floorT=t-P.settle_s}}
+else if(st===ARM)maybeOpen(t,hist);
+else r=update(t,hist);
+if(r)out.push(r);states.push(st);smooth.push(xs)});
+if(st===READ&&lastT!==null){const r=close(lastT,hist,false);if(r)out.push(r)}
+return{events:out,states,smooth}}
+
+const HZ=20,DUR=40,N=DUR*HZ,TS=Array.from({length:N},(_,i)=>i/HZ);
+const ss=u=>{u=Math.min(1,Math.max(0,u));return u*u*(3-2*u)};
+const SQ=[{t0:10,rise:3,hold:1,fall:5,amp:0.30,under:-0.05},{t0:26,rise:2.5,hold:0.5,fall:4,amp:0.17,under:-0.02}];
+function shape(t){let s=0;for(const q of SQ){if(t<q.t0)continue;const a=t-q.t0;
+if(a<q.rise)s+=q.amp*ss(a/q.rise);else if(a<q.rise+q.hold)s+=q.amp;
+else if(a<q.rise+q.hold+q.fall)s+=q.amp+(q.under-q.amp)*ss((a-q.rise-q.hold)/q.fall);
+else s+=q.under*(1-ss((a-q.rise-q.hold-q.fall)/3))}return s}
+function rng(a){return()=>{a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+let bumps=[],white=[];
+function reseed(seed){const r=rng(seed);bumps=Array.from({length:16},()=>({t:2+r()*36,a:(r()<.5?-1:1)*(0.06+r()*0.08),w:0.3+r()*0.5}));white=TS.map(()=>r()*2-1)}
+function signal(f){return TS.map((t,i)=>{let x=shape(t);for(const b of bumps)x+=f*b.a*Math.exp(-(((t-b.t)/b.w)**2));return x+(0.003+0.01*f)*white[i]})}
+
+const cv=document.getElementById('cv'),evEl=document.getElementById('evs');
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+let seed=7;reseed(seed);
+function render(){
+const f=+document.getElementById('fid').value,raw=signal(f),res=detect(P,TS,raw);
+const pc=v=>(Math.exp(v)-1)*100;
+const r=cv.getBoundingClientRect(),dpr=devicePixelRatio||1;cv.width=r.width*dpr;cv.height=r.height*dpr;
+const c=cv.getContext('2d');c.setTransform(dpr,0,0,dpr,0,0);
+const W=r.width,H=r.height,L=44,R=W-12,T=36,B=H-26;
+const lo=Math.min(...raw.map(pc))-3,hi=Math.max(...raw.map(pc))+3;
+const X=t=>L+(t/DUR)*(R-L),Y=v=>B-(v-lo)/(hi-lo)*(B-T);
+c.font='11px system-ui';c.fillStyle=css('--mut');c.strokeStyle=css('--line');c.lineWidth=1;
+for(let v=Math.ceil(lo/10)*10;v<=hi;v+=10){c.beginPath();c.moveTo(L,Y(v));c.lineTo(R,Y(v));c.stroke();c.textAlign='right';c.fillText(v+'%',L-6,Y(v)+4)}
+c.textAlign='center';for(let t=0;t<=DUR;t+=5)c.fillText(t+'s',X(t),H-8);
+const col=[css('--idle'),css('--arm'),css('--read')];
+res.states.forEach((s,i)=>{c.fillStyle=col[s];c.fillRect(X(TS[i]),10,X(1/HZ)-X(0)+0.6,14)});
+const line=(arr,color,w)=>{c.beginPath();arr.forEach((v,i)=>{const x=X(TS[i]),y=Y(pc(v));i?c.lineTo(x,y):c.moveTo(x,y)});c.strokeStyle=color;c.lineWidth=w;c.stroke()};
+line(raw,css('--raw'),1);line(res.smooth,css('--sm'),2);
+c.strokeStyle=css('--ev');c.fillStyle=css('--ev');c.textAlign='center';
+res.events.forEach(e=>{
+c.lineWidth=1;c.setLineDash([4,3]);
+for(const t of[e.t_start,e.t_end]){c.beginPath();c.moveTo(X(t),T-4);c.lineTo(X(t),B);c.stroke()}
+c.setLineDash([]);const px=X(e.t_peak),py=Y(pc(res.smooth[Math.round(e.t_peak*HZ)]||0));
+c.beginPath();c.arc(px,py,4,0,7);c.fill();
+c.fillText((e.amp>0?'+':'')+e.amp.toFixed(1)+'%',px,py-9)});
+c.setLineDash([]);
+evEl.textContent=res.events.length?res.events.map((e,i)=>`#${i+1} ${e.d>0?'up  ':'down'} start ${e.t_start.toFixed(1)}s  peak ${e.t_peak.toFixed(1)}s  end ${e.t_end.toFixed(1)}s  amp ${e.amp.toFixed(1)}%  ${e.rate.toFixed(1)}%/s${e.rebound?'  rebound':''}`).join('\n'):'no events detected'}
+
+const grid=document.getElementById('grid'),inputs={};
+GROUPS.forEach(([title,ps])=>{
+const fs=document.createElement('fieldset');fs.innerHTML=`<legend>${title}</legend>`;
+ps.forEach(([k,d,mn,mx,st,desc,na])=>{
+const row=document.createElement('div');row.className='row';
+row.innerHTML=`<b>${k}${na?' <span class="na">(not used in demo)</span>':''}</b><input type="number" step="${st}" value="${d}" aria-label="${k}"><input type="range" min="${mn}" max="${mx}" step="${st}" value="${d}" aria-label="${k} slider"><small>${desc}</small>`;
+const[num,rng_]=row.querySelectorAll('input');inputs[k]=[num,rng_];
+const set=v=>{if(!isFinite(v))return;P[k]=v;num.value=v;rng_.value=v;render()};
+rng_.oninput=()=>set(parseFloat(rng_.value));
+num.onchange=()=>set(parseFloat(num.value));
+fs.appendChild(row)});
+grid.appendChild(fs)});
+
+const fid=document.getElementById('fid');
+fid.oninput=()=>{document.getElementById('fidv').textContent=(+fid.value).toFixed(2);render()};
+document.getElementById('seed').onclick=()=>{reseed(++seed*7919);render()};
+document.getElementById('reset').onclick=()=>{for(const k in DEF){P[k]=DEF[k];inputs[k][0].value=DEF[k];inputs[k][1].value=DEF[k]}render()};
+
+function toml(name){
+const f=v=>Number.isInteger(v)?v.toFixed(1):String(+v.toFixed(6));
+let s=`# ${name}.elron1115.toml: detector tunables for elron1115\n# Every key is a field of Params. Anything omitted falls back to the dataclass default.\n# All values are floats (write 2.0, not 2).\n`;
+for(const[title,ps]of GROUPS){s+=`\n# --- ${title} ${'-'.repeat(Math.max(3,76-title.length))}\n`;
+for(const p of ps)s+=`${p[0].padEnd(15)} = ${f(P[p[0]]).padEnd(6)} # ${p[5]}\n`}
+return s}
+document.getElementById('save').onclick=()=>{
+const name=(document.getElementById('name').value.trim()||'profile').replace(/[^\w.-]/g,'_');
+const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([toml(name)],{type:'text/plain'}));
+a.download=name+'.elron1115.toml';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1000)};
+addEventListener('resize',render);render();
+</script>
+</body></html>

@@ -3,7 +3,7 @@
 # All values are floats (write 2.0, not 2).
 
 # --- setup-dependent: sample rate, noise floor, electrode contact ------------
-smooth_tau_s    = 0.15   # tiny input filter
+smooth_tau_s    = 0.33   # tiny input filter
 flat_pct        = 2.0    # "flat" = within this many % over settle_s
 min_rate_pct_s  = 1.0    # must be moving at least this fast (drift is ~0.25)
 rate_win_s      = 0.5    # window for the peak-speed measurement
