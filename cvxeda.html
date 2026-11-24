@@ -1,0 +1,883 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>editor + cvxEDA</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: #111;
+      color: #ddd;
+      font-family: monospace;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    #toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 12px;
+      border-bottom: 1px solid #333;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    #toolbar button,
+    #toolbar label {
+      background: #222;
+      border: 1px solid #444;
+      color: #ddd;
+      font-family: monospace;
+      font-size: 12px;
+      padding: 4px 10px;
+      cursor: pointer;
+    }
+
+    #toolbar button:hover,
+    #toolbar label:hover {
+      border-color: #aaa;
+    }
+
+    #toolbar button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    #time-display {
+      margin-left: auto;
+      font-size: 12px;
+      color: #888;
+    }
+
+    .layer-toggles {
+      display: flex;
+      gap: 10px;
+      font-size: 12px;
+      padding-left: 10px;
+      border-left: 1px solid #444;
+    }
+
+    .layer-toggles label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+    }
+
+    /* main area */
+    #workspace {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* annotation lane */
+    #annotation-lane {
+      flex: 1;
+      position: relative;
+      border-bottom: 1px solid #333;
+      overflow: hidden;
+      cursor: crosshair;
+    }
+
+    .note-block {
+      position: absolute;
+      top: 8px;
+      height: calc(100% - 16px);
+      background: #1a2a1a;
+      border: 1px solid #4a4;
+      border-radius: 2px;
+      overflow: hidden;
+    }
+
+    .note-block textarea {
+      width: 100%;
+      height: 100%;
+      background: transparent;
+      border: none;
+      color: #aea;
+      font-family: monospace;
+      font-size: 11px;
+      resize: none;
+      padding: 4px;
+      cursor: text;
+    }
+
+    .note-block textarea:focus {
+      outline: none;
+    }
+
+    .note-block .close-btn {
+      position: absolute;
+      top: 2px;
+      right: 2px;
+      background: none;
+      border: none;
+      color: #666;
+      cursor: pointer;
+      font-size: 10px;
+      line-height: 1;
+      padding: 0 2px;
+    }
+
+    .note-block .close-btn:hover {
+      color: #f66;
+    }
+
+    /* waveform lane */
+    #waveform-lane {
+      height: 200px;
+      /* Made taller to see the components clearly */
+      position: relative;
+      flex-shrink: 0;
+      overflow: hidden;
+      cursor: ew-resize;
+    }
+
+    #waveform-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+    }
+
+    #empty {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      color: #444;
+      font-size: 13px;
+      pointer-events: none;
+    }
+
+    /* vertical mode */
+    #workspace.vertical {
+      flex-direction: row;
+    }
+
+    #workspace.vertical #annotation-lane {
+      flex: 1;
+      border-bottom: none;
+      border-right: 1px solid #333;
+    }
+
+    #workspace.vertical #waveform-lane {
+      width: 200px;
+      height: auto;
+      cursor: ns-resize;
+    }
+
+    #solver-status {
+      font-size: 11px;
+      color: #fa0;
+      margin-left: 10px;
+    }
+  </style>
+</head>
+
+<body>
+
+  <div id="toolbar">
+    <label>
+      <input type="file" id="file-input" accept=".srt" style="display:none">
+      open srt
+    </label>
+    <button id="save-btn" disabled>save srt</button>
+    <button id="flip-btn">flip ↕</button>
+
+    <div class="layer-toggles">
+      <label style="color:#ff4444;"><input type="checkbox" id="chk-raw" checked> Raw</label>
+      <label style="color:#4488ff;"><input type="checkbox" id="chk-tonic"> Tonic (t)</label>
+      <label style="color:#44ff88;"><input type="checkbox" id="chk-phasic"> Phasic (r)</label>
+      <label style="color:#ffcc00;"><input type="checkbox" id="chk-driver"> Driver (p)</label>
+    </div>
+
+    <span id="solver-status"></span>
+    <div id="time-display">—</div>
+  </div>
+
+  <div id="workspace">
+    <div id="annotation-lane">
+      <div id="empty">open an srt file to begin</div>
+    </div>
+    <div id="waveform-lane">
+      <canvas id="waveform-canvas"></canvas>
+    </div>
+  </div>
+
+  <script>
+    // --- state ---
+    let frames = [];
+    let decimals = 1;
+    let notes = [];
+    let sessionName = '';
+    let viewStart = 0;
+    let viewEnd = 0;
+
+    // cvxEDA Data
+    let cvxData = null; // { r: [], p: [], t: [], d: [], e: [] }
+    let cvxStatus = "";
+
+    let dragging = null;
+    let dragNote = null;
+    let nextId = 0;
+    let cursorMs = 0;
+    let verticalMode = false;
+
+    const filePicker = document.getElementById('file-input');
+    const saveBtn = document.getElementById('save-btn');
+    const timeDisplay = document.getElementById('time-display');
+    const annoLane = document.getElementById('annotation-lane');
+    const wfLane = document.getElementById('waveform-lane');
+    const canvas = document.getElementById('waveform-canvas');
+    const ctx = canvas.getContext('2d');
+    const solverStatus = document.getElementById('solver-status');
+
+    const phAnno = document.createElement('div');
+    phAnno.style.cssText = 'position:absolute;top:0;width:1px;background:#f88;pointer-events:none;z-index:10;display:none;';
+    annoLane.appendChild(phAnno);
+
+    const phWf = document.createElement('div');
+    phWf.style.cssText = 'position:absolute;top:0;width:1px;background:#f88;pointer-events:none;z-index:10;display:none;';
+    wfLane.appendChild(phWf);
+
+    // --- SRT parse ---
+    function parseSRT(text) {
+      const edaFrames = [];
+      let maxDec = 0;
+      const savedNotes = [];
+      const blocks = text.trim().split(/\n\s*\n/);
+      for (const block of blocks) {
+        const lines = block.trim().split('\n');
+        if (lines.length < 3) continue;
+        const tc = lines[1].split('-->');
+        if (tc.length < 2) continue;
+        const t0 = tcToMs(tc[0].trim());
+        const t1 = tcToMs(tc[1].trim());
+        const contentLines = lines.slice(2);
+
+        const noteMatch = contentLines.join('\n').match(/^\[([^]*)\](\s*READ)?$/);
+        if (noteMatch) {
+          savedNotes.push({ id: nextId++, t0, t1, text: noteMatch[1].replace(/\\n/g, '\n'), read: !!noteMatch[2] });
+          continue;
+        }
+
+        const val = contentLines.join('\n').trim();
+        if (val === 'OPEN') {
+          edaFrames.push({ t_ms: t0, end_ms: t1, nS: null });
+          continue;
+        }
+        const m = val.match(/^(-?\d+(?:\.\d+)?)$/);
+        if (!m) continue;
+        maxDec = Math.max(maxDec, (m[1].split('.')[1] || '').length);
+        edaFrames.push({ t_ms: t0, end_ms: t1, nS: parseFloat(m[1]) });
+      }
+      return { edaFrames, savedNotes, maxDec };
+    }
+
+    function tcToMs(tc) {
+      const [hms, ms] = tc.split(',');
+      const [h, m, s] = hms.split(':').map(Number);
+      return ((h * 3600 + m * 60 + s) * 1000) + (parseInt(ms) || 0);
+    }
+
+    function msToTc(ms) {
+      ms = Math.round(ms);
+      const h = Math.floor(ms / 3600000); ms %= 3600000;
+      const m = Math.floor(ms / 60000); ms %= 60000;
+      const s = Math.floor(ms / 1000); ms %= 1000;
+      return `${pad(h)}:${pad(m)}:${pad(s)},${pad(ms, 3)}`;
+    }
+
+    function pad(n, w = 2) { return String(n).padStart(w, '0'); }
+
+    // --- load ---
+    filePicker.onchange = e => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = ev => {
+        const parsed = parseSRT(ev.target.result);
+        frames = parsed.edaFrames;
+        if (!frames.some(f => f.nS !== null)) return;
+        decimals = parsed.maxDec;
+        notes = parsed.savedNotes;
+        sessionName = file.name.replace(/\.srt$/i, '');
+        viewStart = frames[0].t_ms;
+        viewEnd = frames[frames.length - 1].t_ms;
+
+        document.getElementById('empty').style.display = 'none';
+        saveBtn.disabled = false;
+
+        cvxData = null;
+        solverStatus.textContent = "Running cvxEDA...";
+
+        // Run cvxEDA asynchronously so UI doesn't freeze
+        setTimeout(() => {
+          runCvxEDA();
+          render();
+        }, 100);
+      };
+      reader.readAsText(file);
+    };
+
+    document.getElementById('flip-btn').onclick = () => {
+      verticalMode = !verticalMode;
+      document.getElementById('workspace').classList.toggle('vertical', verticalMode);
+      document.getElementById('flip-btn').textContent = verticalMode ? 'flip ↔' : 'flip ↕';
+      if (frames.length) render();
+    };
+
+    ['raw', 'tonic', 'phasic', 'driver'].forEach(id => {
+      document.getElementById('chk-' + id).onchange = () => { if (frames.length) render(); };
+    });
+
+    // --- coordinate helpers ---
+    function msToX(ms, laneW) { return (ms - viewStart) / (viewEnd - viewStart) * laneW; }
+    function xToMs(x, laneW) { return viewStart + (x / laneW) * (viewEnd - viewStart); }
+
+    // --- render waveform ---
+    function renderWaveform() {
+      const W = wfLane.clientWidth;
+      const H = wfLane.clientHeight;
+      canvas.width = W;
+      canvas.height = H;
+      ctx.clearRect(0, 0, W, H);
+
+      if (!frames.length) return;
+
+      const visFrames = frames.filter(f => f.t_ms >= viewStart && f.t_ms <= viewEnd);
+      if (visFrames.length < 2) return;
+
+      const showRaw = document.getElementById('chk-raw').checked;
+      const showTonic = document.getElementById('chk-tonic').checked;
+      const showPhasic = document.getElementById('chk-phasic').checked;
+      const showDriver = document.getElementById('chk-driver').checked;
+
+      const getCvxVis = (arr) => {
+        if (!cvxData || !arr) return [];
+        return visFrames.map(f => {
+          const idx = frames.indexOf(f);
+          return { t_ms: f.t_ms, val: arr[idx] };
+        }).filter(f => f.val !== undefined && f.val !== null);
+      };
+
+      const visTonic = showTonic ? getCvxVis(cvxData?.t) : [];
+      const visPhasic = showPhasic ? getCvxVis(cvxData?.r) : [];
+      const visDriver = showDriver ? getCvxVis(cvxData?.p) : [];
+
+      const drawLine = (data, color, lineWidth, isRaw = false) => {
+        if (!data || data.length < 2) return;
+
+        let lo = Infinity, hi = -Infinity;
+        for (const f of data) {
+          const v = isRaw ? f.nS : f.val;
+          if (v === null || v === undefined) continue;
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        }
+        if (lo === Infinity) return;
+        const range = (hi - lo) || 1;
+
+        ctx.strokeStyle = color;
+        ctx.lineWidth = lineWidth;
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+
+        let pen = false;
+        data.forEach(f => {
+          const val = isRaw ? f.nS : f.val;
+          if (val === null || val === undefined) { pen = false; return; }
+
+          const normVal = (val - lo) / range;
+
+          if (verticalMode) {
+            const y = msToX(f.t_ms, H);
+            const x = normVal * (W - 20) + 10;
+            pen ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+          } else {
+            const x = msToX(f.t_ms, W);
+            const y = H - (normVal * (H - 20)) - 10;
+            pen ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+          }
+          pen = true;
+        });
+        ctx.stroke();
+      };
+
+      if (showTonic) drawLine(visTonic, '#4488ff', 1.5);
+      if (showPhasic) drawLine(visPhasic, '#44ff88', 1.5);
+      if (showDriver) drawLine(visDriver, '#ffcc00', 1.5);
+
+      // Draw raw last (top layer) and make it slightly thicker so it stands out
+      if (showRaw) drawLine(visFrames, '#ff4444', 2.0, true);
+    }
+
+    // --- render note blocks ---
+    function renderNotes() {
+      const W = annoLane.clientWidth;
+      const H = annoLane.clientHeight;
+      const span = verticalMode ? H : W;
+      annoLane.querySelectorAll('.note-block').forEach(el => el.remove());
+      for (const note of notes) {
+        const p0 = msToX(note.t0, span);
+        const p1 = msToX(note.t1, span);
+        if (p1 < 0 || p0 > span) continue;
+        const el = document.createElement('div');
+        el.className = 'note-block';
+
+        if (verticalMode) {
+          el.style.cssText = `position:absolute;left:8px;width:calc(100% - 16px);top:${p0}px;height:${p1 - p0}px;background:#1a2a1a;border:1px solid #4a4;border-radius:2px;overflow:hidden;`;
+        } else {
+          el.style.left = p0 + 'px';
+          el.style.width = (p1 - p0) + 'px';
+        }
+        el.dataset.id = note.id;
+
+        const ta = document.createElement('textarea');
+        ta.value = note.text;
+        ta.placeholder = 'annotate…';
+        ta.onclick = e => e.stopPropagation();
+        ta.oninput = e => { note.text = e.target.value; };
+        el.appendChild(ta);
+
+        const readCb = document.createElement('input');
+        readCb.type = 'checkbox';
+        readCb.checked = !!note.read;
+        readCb.title = 'read';
+        readCb.style.cssText = 'position:absolute;bottom:4px;left:4px;cursor:pointer;';
+        readCb.onclick = e => e.stopPropagation();
+        readCb.onchange = e => { note.read = e.target.checked; };
+        el.appendChild(readCb);
+
+        const cb = document.createElement('button');
+        cb.className = 'close-btn';
+        cb.textContent = '×';
+        cb.onclick = e => {
+          e.stopPropagation();
+          notes = notes.filter(n => n.id !== note.id);
+          render();
+        };
+        el.appendChild(cb);
+        annoLane.appendChild(el);
+      }
+    }
+
+    function render() {
+      renderWaveform();
+      renderNotes();
+      updatePlayhead();
+    }
+
+    function updatePlayhead() {
+      const W = annoLane.clientWidth;
+      const H = annoLane.clientHeight;
+      if (verticalMode) {
+        const y = msToX(cursorMs, H);
+        if (y >= 0 && y <= H) {
+          phAnno.style.display = 'block'; phAnno.style.left = '0'; phAnno.style.top = y + 'px';
+          phAnno.style.width = annoLane.clientWidth + 'px'; phAnno.style.height = '1px';
+          phWf.style.display = 'block'; phWf.style.left = '0'; phWf.style.top = y + 'px';
+          phWf.style.width = wfLane.clientWidth + 'px'; phWf.style.height = '1px';
+        }
+      } else {
+        const x = msToX(cursorMs, W);
+        if (x >= 0 && x <= W) {
+          phAnno.style.display = 'block'; phAnno.style.left = x + 'px'; phAnno.style.top = '0';
+          phAnno.style.width = '1px'; phAnno.style.height = annoLane.clientHeight + 'px';
+          phWf.style.display = 'block'; phWf.style.left = x + 'px'; phWf.style.top = '0';
+          phWf.style.width = '1px'; phWf.style.height = wfLane.clientHeight + 'px';
+        }
+      }
+      timeDisplay.textContent = msToTc(cursorMs);
+    }
+
+    // --- annotation lane: click-drag to create note ---
+    let dragStart = null;
+
+    annoLane.onmousedown = e => {
+      if (e.target !== annoLane) return;
+      const span = verticalMode ? annoLane.clientHeight : annoLane.clientWidth;
+      const pos = verticalMode ? e.offsetY : e.offsetX;
+      dragStart = { x: pos, ms: xToMs(pos, span) };
+    };
+
+    annoLane.onmousemove = e => {
+      if (!frames.length) return;
+      if (e.target !== annoLane) return;
+      const span = verticalMode ? annoLane.clientHeight : annoLane.clientWidth;
+      const pos = verticalMode ? e.offsetY : e.offsetX;
+      cursorMs = xToMs(pos, span);
+      updatePlayhead();
+
+      if (dragStart) {
+        const p0 = Math.min(dragStart.x, pos);
+        const p1 = Math.max(dragStart.x, pos);
+        if (!dragNote) {
+          dragNote = document.createElement('div');
+          dragNote.className = 'note-block';
+          dragNote.style.pointerEvents = 'none';
+          annoLane.appendChild(dragNote);
+        }
+        if (verticalMode) {
+          dragNote.style.cssText = `position:absolute;left:8px;width:calc(100% - 16px);top:${p0}px;height:${p1 - p0}px;background:#1a2a1a;border:1px solid #4a4;border-radius:2px;pointer-events:none;`;
+        } else {
+          dragNote.style.left = p0 + 'px';
+          dragNote.style.width = (p1 - p0) + 'px';
+        }
+      }
+    };
+
+    annoLane.onmouseup = e => {
+      if (!dragStart) return;
+      const span = verticalMode ? annoLane.clientHeight : annoLane.clientWidth;
+      const pos = verticalMode ? e.offsetY : e.offsetX;
+      const ms1 = xToMs(pos, span);
+      const t0 = Math.min(dragStart.ms, ms1);
+      const t1 = Math.max(dragStart.ms, ms1);
+
+      if (dragNote) { dragNote.remove(); dragNote = null; }
+
+      if (t1 - t0 > 200) {
+        notes.push({ id: nextId++, t0, t1, text: '' });
+        render();
+        setTimeout(() => {
+          const last = annoLane.querySelectorAll('.note-block');
+          if (last.length) last[last.length - 1].querySelector('textarea').focus();
+        }, 10);
+      }
+      dragStart = null;
+    };
+
+    // --- waveform lane: pan ---
+    let panStart = null;
+
+    wfLane.onmousedown = e => {
+      panStart = { x: e.clientX, y: e.clientY, vs: viewStart, ve: viewEnd };
+    };
+
+    window.onmousemove = e => {
+      if (!panStart || !frames.length) return;
+      const span = panStart.ve - panStart.vs;
+      const totalStart = frames[0].t_ms;
+      const totalEnd = frames[frames.length - 1].t_ms;
+      let dms;
+      if (verticalMode) {
+        const H = wfLane.clientHeight;
+        const dy = e.clientY - panStart.y;
+        dms = -(dy / H) * span;
+      } else {
+        const W = wfLane.clientWidth;
+        const dx = e.clientX - panStart.x;
+        dms = -(dx / W) * span;
+      }
+      viewStart = Math.max(totalStart, Math.min(panStart.vs + dms, totalEnd - span));
+      viewEnd = viewStart + span;
+      render();
+    };
+
+    window.onmouseup = () => { panStart = null; };
+
+    // --- waveform lane: scroll to zoom ---
+    wfLane.onwheel = e => {
+      if (!frames.length) return;
+      e.preventDefault();
+      const W = wfLane.clientWidth;
+      const H = wfLane.clientHeight;
+      const mouseMs = verticalMode ? xToMs(e.offsetY, H) : xToMs(e.offsetX, W);
+      const span = viewEnd - viewStart;
+      const factor = e.deltaY > 0 ? 1.15 : 0.87;
+      const newSpan = Math.max(2000, Math.min(span * factor, frames[frames.length - 1].t_ms - frames[0].t_ms));
+      const ratio = (mouseMs - viewStart) / span;
+      viewStart = mouseMs - ratio * newSpan;
+      viewEnd = viewStart + newSpan;
+      const totalStart = frames[0].t_ms;
+      const totalEnd = frames[frames.length - 1].t_ms;
+      if (viewStart < totalStart) { viewStart = totalStart; viewEnd = viewStart + newSpan; }
+      if (viewEnd > totalEnd) { viewEnd = totalEnd; viewStart = viewEnd - newSpan; }
+      render();
+    };
+
+    wfLane.onmousemove = e => {
+      if (!frames.length || panStart) return;
+      const span = verticalMode ? wfLane.clientHeight : wfLane.clientWidth;
+      const pos = verticalMode ? e.offsetY : e.offsetX;
+      cursorMs = xToMs(pos, span);
+      updatePlayhead();
+    };
+
+    // --- save ---
+    saveBtn.onclick = () => {
+      if (!frames.length) return;
+      let out = '';
+      let idx = 1;
+      frames.forEach(f => {
+        const val = f.nS === null ? 'OPEN' : f.nS.toFixed(decimals);
+        out += `${idx++}\n${msToTc(f.t_ms)} --> ${msToTc(f.end_ms)}\n${val}\n\n`;
+      });
+      notes.forEach(n => {
+        const encoded = n.text.replace(/\n/g, '\\n');
+        out += `${idx++}\n${msToTc(n.t0)} --> ${msToTc(n.t1)}\n[${encoded}]${n.read ? ' READ' : ''}\n\n`;
+      });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([out], { type: 'text/plain' }));
+      a.download = `${sessionName || 'session'}_annotated.srt`;
+      a.hidden = true; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    };
+
+    window.onresize = () => { if (frames.length) render(); };
+
+    // =====================================================================
+    // CVXEDA INTEGRATION (Pure JS Port)
+    // =====================================================================
+
+    function runCvxEDA() {
+      const validFrames = frames.filter(f => f.nS !== null);
+      if (validFrames.length < 10) { solverStatus.textContent = "Not enough data"; return; }
+
+      const y = validFrames.map(f => f.nS);
+      const dt = (validFrames[1].t_ms - validFrames[0].t_ms) / 1000;
+
+      try {
+        const startTime = performance.now();
+        const res = window.cvxEDA(y, dt);
+        const endTime = performance.now();
+
+        const fullR = new Array(frames.length).fill(null);
+        const fullP = new Array(frames.length).fill(null);
+        const fullT = new Array(frames.length).fill(null);
+
+        let vIdx = 0;
+        for (let i = 0; i < frames.length; i++) {
+          if (frames[i].nS !== null) {
+            fullR[i] = res.r[vIdx];
+            fullP[i] = res.p[vIdx];
+            fullT[i] = res.t[vIdx];
+            vIdx++;
+          }
+        }
+
+        cvxData = { r: fullR, p: fullP, t: fullT };
+
+        let msg = `cvxEDA: ${res.iterations} iters, ${(endTime - startTime).toFixed(0)}ms.`;
+        if (!res.converged) msg += " (WARNING: did not converge)";
+        solverStatus.textContent = msg;
+
+      } catch (e) {
+        solverStatus.textContent = "cvxEDA Error: " + e.message;
+        console.error(e);
+      }
+    }
+
+    (function () {
+      function dot(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
+      function norm(a) { return Math.sqrt(dot(a, a)); }
+      function colDot(a, b) {
+        const lo = Math.max(a.r0, b.r0), hi = Math.min(a.r0 + a.v.length, b.r0 + b.v.length);
+        let s = 0; for (let i = lo; i < hi; i++) s += a.v[i - a.r0] * b.v[i - b.r0]; return s;
+      }
+      function colDotDense(a, u) { let s = 0; for (let i = 0; i < a.v.length; i++) s += a.v[i] * u[a.r0 + i]; return s; }
+      function denseCholesky(S, m) {
+        for (let j = 0; j < m; j++) {
+          let d = S[j * m + j];
+          for (let k = 0; k < j; k++) d -= S[j * m + k] * S[j * m + k];
+          if (!(d > 0) || !isFinite(d)) return false;
+          const ljj = Math.sqrt(d); S[j * m + j] = ljj;
+          for (let i = j + 1; i < m; i++) {
+            let s = S[i * m + j];
+            for (let k = 0; k < j; k++) s -= S[i * m + k] * S[j * m + k];
+            S[i * m + j] = s / ljj;
+          }
+        } return true;
+      }
+      function denseCholSolve(L, m, b, out) {
+        for (let i = 0; i < m; i++) { let s = b[i]; for (let k = 0; k < i; k++) s -= L[i * m + k] * out[k]; out[i] = s / L[i * m + i]; }
+        for (let i = m - 1; i >= 0; i--) { let s = out[i]; for (let k = i + 1; k < m; k++) s -= L[k * m + i] * out[k]; out[i] = s / L[i * m + i]; }
+      }
+      function pyRound(x) {
+        const f = Math.floor(x), diff = x - f;
+        if (diff < 0.5) return f; if (diff > 0.5) return f + 1;
+        return f % 2 === 0 ? f : f + 1;
+      }
+
+      window.cvxEDA = function (yIn, delta, opts = {}) {
+        const { tau0 = 2.0, tau1 = 0.7, deltaKnot = 10.0, alpha = 8e-4, gamma = 1e-2, baselineCorrection = 2 } = opts;
+        const so = { reltol: 1e-9, abstol: 1e-7, feastol: 1e-7, maxIter: 100, ...opts.solver };
+        const n = yIn.length;
+        if (n < 3) throw new Error("cvxEDA: signal must have at least 3 samples");
+        const y = Float64Array.from(yIn);
+
+        const a1 = 1 / Math.min(tau1, tau0), a0 = 1 / Math.max(tau1, tau0);
+        const den = (a1 - a0) * delta * delta;
+        const ar = [((a1 * delta + 2) * (a0 * delta + 2)) / den, (2 * a1 * a0 * delta * delta - 8) / den, ((a1 * delta - 2) * (a0 * delta - 2)) / den];
+        const ma = [1, 2, 1];
+
+        const bandMul = (c, x, out) => { for (let i = 0; i < n; i++) { let s = c[0] * x[i]; if (i >= 1) s += c[1] * x[i - 1]; if (i >= 2) s += c[2] * x[i - 2]; out[i] = s; } };
+        const bandMulT = (c, v, out) => { for (let j = 0; j < n; j++) { let s = c[0] * v[j]; if (j + 1 < n) s += c[1] * v[j + 1]; if (j + 2 < n) s += c[2] * v[j + 2]; out[j] = s; } };
+
+        let knots = [], deltaKnotS;
+        if (typeof deltaKnot === "number") {
+          deltaKnotS = pyRound(deltaKnot / delta);
+          if (deltaKnotS < 1) throw new Error("cvxEDA: deltaKnot must be at least one sample");
+          for (let k = 0; k < n + Math.floor(deltaKnotS / 2); k += deltaKnotS) knots.push(k);
+        } else {
+          knots = Array.from(deltaKnot); deltaKnotS = knots[1] - knots[0];
+        }
+        const tri = []; for (let v = 1; v < deltaKnotS; v++) tri.push(v); for (let v = deltaKnotS; v > 0; v--) tri.push(v);
+        const splLen = 2 * tri.length - 1, spl = new Float64Array(splLen);
+        for (let i = 0; i < tri.length; i++) for (let j = 0; j < tri.length; j++) spl[i + j] += tri[i] * tri[j];
+        const splMax = Math.max(...spl); for (let i = 0; i < splLen; i++) spl[i] /= splMax;
+
+        const nB = knots.length, Bcols = [];
+        for (let k = 0; k < nB; k++) {
+          const start = knots[k] - (splLen >> 1), lo = Math.max(0, start), hi = Math.min(n, start + splLen);
+          Bcols.push(hi > lo ? { r0: lo, v: spl.slice(lo - start, hi - start) } : { r0: 0, v: new Float64Array(0) });
+        }
+        const Ccols = [];
+        if (baselineCorrection === "spline_offset") {
+          const c = new Float64Array(n); for (const col of Bcols) for (let i = 0; i < col.v.length; i++) c[col.r0 + i] += col.v[i];
+          Ccols.push({ r0: 0, v: c });
+        } else if (baselineCorrection >= 1) {
+          Ccols.push({ r0: 0, v: new Float64Array(n).fill(1) });
+          if (baselineCorrection === 2) { const c = new Float64Array(n); for (let i = 0; i < n; i++) c[i] = (i + 1) / n; Ccols.push({ r0: 0, v: c }); }
+        }
+
+        const nC = Ccols.length;
+
+        const W = [...Ccols, ...Bcols], m = W.length;
+        const applyW = (w, out) => { out.fill(0); for (let j = 0; j < m; j++) { const { r0, v } = W[j], wj = w[j]; for (let i = 0; i < v.length; i++) out[r0 + i] += v[i] * wj; } };
+        const applyWt = (u, out) => { for (let j = 0; j < m; j++) out[j] = colDotDense(W[j], u); };
+
+        const tmpN = new Float64Array(n), ones = new Float64Array(n).fill(1), fq = new Float64Array(n);
+        bandMulT(ar, ones, tmpN); const MtY = new Float64Array(n); bandMulT(ma, y, MtY);
+        for (let i = 0; i < n; i++) fq[i] = alpha * tmpN[i] - MtY[i];
+        const fw = new Float64Array(m); applyWt(y, fw); for (let j = 0; j < m; j++) fw[j] = -fw[j];
+        const normF = Math.sqrt(dot(fq, fq) + dot(fw, fw));
+
+        const addBand = (band, c, weight) => {
+          for (let k = 0; k < n; k++) {
+            const wk = typeof weight === "number" ? weight : weight[k];
+            for (let a = 0; a < 3; a++) for (let b = a; b < 3; b++) if (k - b >= 0) band[b - a][k - a] += wk * c[a] * c[b];
+          }
+        };
+        const mm = [new Float64Array(n), new Float64Array(n), new Float64Array(n)]; addBand(mm, ma, 1);
+        const Hqw = W.map(({ r0, v }) => {
+          const lo = Math.max(0, r0 - 2), hi = Math.min(n, r0 + v.length), out = new Float64Array(Math.max(0, hi - lo));
+          const get = (k) => (k >= r0 && k < r0 + v.length ? v[k - r0] : 0);
+          for (let i = lo; i < hi; i++) out[i - lo] = ma[0] * get(i) + ma[1] * get(i + 1) + ma[2] * get(i + 2);
+          return { r0: lo, v: out };
+        });
+        const Hww = new Float64Array(m * m);
+        for (let a = 0; a < m; a++) {
+          for (let b = a; b < m; b++) { const v = colDot(W[a], W[b]); Hww[a * m + b] = v; Hww[b * m + a] = v; }
+          if (a >= nC) Hww[a * m + a] += gamma;
+        }
+        const hxU = new Float64Array(n), hxMq = new Float64Array(n), hxWw = new Float64Array(n);
+        const Hx = (q, w, outQ, outW) => {
+          bandMul(ma, q, hxMq); applyW(w, hxWw); for (let i = 0; i < n; i++) hxU[i] = hxMq[i] + hxWw[i];
+          bandMulT(ma, hxU, outQ); applyWt(hxU, outW); for (let j = nC; j < m; j++) outW[j] += gamma * w[j];
+        };
+
+        const q = new Float64Array(n), w = new Float64Array(m), s = new Float64Array(n).fill(1), z = new Float64Array(n).fill(1);
+        const Hq = new Float64Array(n), Hw = new Float64Array(m), Atz = new Float64Array(n), Aq = new Float64Array(n);
+        const rdq = new Float64Array(n), rdw = new Float64Array(m), rp = new Float64Array(n), D = new Float64Array(n);
+        const k = [new Float64Array(n), new Float64Array(n), new Float64Array(n)], L0 = new Float64Array(n), L1 = new Float64Array(n), L2 = new Float64Array(n);
+        const Z = Array.from({ length: m }, () => new Float64Array(n)), S = new Float64Array(m * m);
+
+        const bandFactor = () => {
+          for (let i = 0; i < n; i++) {
+            const l2 = i >= 2 ? k[2][i] / L0[i - 2] : 0;
+            const l1 = i >= 1 ? (k[1][i] - (i >= 2 ? l2 * L1[i - 1] : 0)) / L0[i - 1] : 0;
+            const d = k[0][i] - l1 * l1 - l2 * l2;
+            if (!(d > 0) || !isFinite(d)) return false;
+            L0[i] = Math.sqrt(d); L1[i] = l1; L2[i] = l2;
+          } return true;
+        };
+        const bandSolve = (b, out) => {
+          for (let i = 0; i < n; i++) { let v = b[i]; if (i >= 1) v -= L1[i] * out[i - 1]; if (i >= 2) v -= L2[i] * out[i - 2]; out[i] = v / L0[i]; }
+          for (let i = n - 1; i >= 0; i--) { let v = out[i]; if (i + 1 < n) v -= L1[i + 1] * out[i + 1]; if (i + 2 < n) v -= L2[i + 2] * out[i + 2]; out[i] = v / L0[i]; }
+        };
+
+        const solveU = new Float64Array(n), solveRhsW = new Float64Array(m), solveDw = new Float64Array(m);
+        const solveK = (rq, rw, dq, dw) => {
+          bandSolve(rq, solveU);
+          for (let a = 0; a < m; a++) solveRhsW[a] = rw[a] - colDotDense(Hqw[a], solveU);
+          denseCholSolve(S, m, solveRhsW, solveDw);
+          for (let a = 0; a < m; a++) dw[a] = solveDw[a];
+          for (let i = 0; i < n; i++) dq[i] = solveU[i];
+          for (let b = 0; b < m; b++) { const zb = Z[b], wb = solveDw[b]; for (let i = 0; i < n; i++) dq[i] -= zb[i] * wb; }
+        };
+
+        const dq = new Float64Array(n), dw = new Float64Array(m), ds = new Float64Array(n), dz = new Float64Array(n);
+        const dqA = new Float64Array(n), dwA = new Float64Array(m), dsA = new Float64Array(n), dzA = new Float64Array(n);
+        const rc = new Float64Array(n), vv = new Float64Array(n), rhsQ = new Float64Array(n), rhsW = new Float64Array(m), Adq = new Float64Array(n);
+
+        const direction = (rcv, oq, ow, os, oz) => {
+          for (let i = 0; i < n; i++) vv[i] = (rcv[i] - z[i] * rp[i]) / s[i];
+          bandMulT(ar, vv, tmpN); for (let i = 0; i < n; i++) rhsQ[i] = -rdq[i] + tmpN[i];
+          for (let j = 0; j < m; j++) rhsW[j] = -rdw[j];
+          solveK(rhsQ, rhsW, oq, ow);
+          bandMul(ar, oq, Adq);
+          for (let i = 0; i < n; i++) { os[i] = Adq[i] + rp[i]; oz[i] = vv[i] - D[i] * Adq[i]; }
+        };
+        const maxStep = (x, dx) => { let a = Infinity; for (let i = 0; i < n; i++) if (dx[i] < 0) a = Math.min(a, -x[i] / dx[i]); return a; };
+
+        let converged = false, iterations = 0;
+        for (let iter = 0; iter < so.maxIter; iter++) {
+          iterations = iter;
+          Hx(q, w, Hq, Hw); bandMulT(ar, z, Atz);
+          for (let i = 0; i < n; i++) rdq[i] = Hq[i] + fq[i] - Atz[i];
+          for (let j = 0; j < m; j++) rdw[j] = Hw[j] + fw[j];
+          bandMul(ar, q, Aq); for (let i = 0; i < n; i++) rp[i] = Aq[i] - s[i];
+          const gap = dot(s, z), mu = gap / n;
+          const pobj = 0.5 * (dot(q, Hq) + dot(w, Hw)) + dot(fq, q) + dot(fw, w);
+          const pres = norm(rp) / (1 + norm(s)), dres = Math.sqrt(dot(rdq, rdq) + dot(rdw, rdw)) / (1 + normF);
+          if (pres < so.feastol && dres < so.feastol && (gap < so.abstol || gap < so.reltol * Math.abs(pobj))) { converged = true; break; }
+          for (let i = 0; i < n; i++) D[i] = z[i] / s[i];
+          for (let o = 0; o < 3; o++) k[o].set(mm[o]);
+          addBand(k, ar, D);
+          if (!bandFactor()) break;
+          const col = new Float64Array(n);
+          for (let b = 0; b < m; b++) { col.fill(0); col.set(Hqw[b].v, Hqw[b].r0); bandSolve(col, Z[b]); }
+          for (let a = 0; a < m; a++) for (let b = 0; b < m; b++) S[a * m + b] = Hww[a * m + b] - colDotDense(Hqw[a], Z[b]);
+          if (!denseCholesky(S, m)) break;
+          for (let i = 0; i < n; i++) rc[i] = -s[i] * z[i];
+          direction(rc, dqA, dwA, dsA, dzA);
+          const aAff = Math.min(1, maxStep(s, dsA), maxStep(z, dzA));
+          let muAff = 0; for (let i = 0; i < n; i++) muAff += (s[i] + aAff * dsA[i]) * (z[i] + aAff * dzA[i]); muAff /= n;
+          const sigma = mu > 0 ? Math.pow(Math.max(muAff, 0) / mu, 3) : 0;
+          for (let i = 0; i < n; i++) rc[i] = sigma * mu - s[i] * z[i] - dsA[i] * dzA[i];
+          direction(rc, dq, dw, ds, dz);
+          const aMax = Math.min(maxStep(s, ds), maxStep(z, dz)), step = Math.min(1, 0.99 * aMax);
+          if (!(step > 1e-14) || !isFinite(step)) break;
+          for (let i = 0; i < n; i++) { q[i] += step * dq[i]; s[i] += step * ds[i]; z[i] += step * dz[i]; }
+          for (let j = 0; j < m; j++) w[j] += step * dw[j];
+        }
+
+        const d = w.slice(0, nC), l = w.slice(nC), t = new Float64Array(n);
+        applyW(w, t);
+        const p = new Float64Array(n); bandMul(ar, q, p);
+        const r = new Float64Array(n); bandMul(ma, q, r);
+        const e = new Float64Array(n); let sse = 0, sumP = 0;
+        for (let i = 0; i < n; i++) { e[i] = y[i] - r[i] - t[i]; sse += e[i] * e[i]; sumP += p[i]; }
+        const obj = 0.5 * sse + 0.5 * gamma * dot(l, l) + alpha * sumP;
+        return { r, p, t, l, d, e, obj, iterations, converged };
+      };
+    })();
+
+  </script>
+</body>
+
+</html>
